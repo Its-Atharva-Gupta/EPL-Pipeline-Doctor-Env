@@ -1,9 +1,6 @@
 import hashlib
 import logging
-import time
 from typing import Any
-
-import ollama
 
 from .constants import OLLAMA_MODEL, OLLAMA_TIMEOUT
 
@@ -17,6 +14,36 @@ def _cache_key(*parts: str) -> str:
     return hashlib.sha256(combined.encode()).hexdigest()
 
 
+def get_llm_response(
+    user_prompt: str,
+    system_prompt: str,
+    config: Any = None,  # ProviderConfig | None
+    timeout: float = OLLAMA_TIMEOUT,
+    cache_key: str | None = None,
+) -> str:
+    """Call the configured LLM provider. Falls back to ollama if config is None."""
+    from .llm_providers import call_llm
+
+    if config is None:
+        from models import ProviderConfig
+
+        config = ProviderConfig(provider="ollama", model=OLLAMA_MODEL)
+
+    key = cache_key or _cache_key(config.provider, config.model, system_prompt, user_prompt)
+    if key in _cache:
+        logger.debug("LLM cache hit for key=%s", key[:8])
+        return _cache[key]
+
+    result = call_llm(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        config=config,
+        timeout=timeout,
+    )
+    _cache[key] = result
+    return result
+
+
 def call_ollama(
     system_prompt: str,
     user_prompt: str,
@@ -24,29 +51,14 @@ def call_ollama(
     timeout: float = OLLAMA_TIMEOUT,
     cache_key: str | None = None,
 ) -> str:
-    """Call Ollama with timeout. Returns raw text response."""
-    key = cache_key or _cache_key(system_prompt, user_prompt, model)
-    if key in _cache:
-        logger.debug("LLM cache hit for key=%s", key[:8])
-        return _cache[key]
+    """Backward-compatible wrapper — delegates to get_llm_response with ollama config."""
+    from models import ProviderConfig
 
-    start = time.monotonic()
-    try:
-        response = ollama.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            options={"num_predict": 256},
-            think=False,  # gemma4 is a thinking model; suppress CoT to get content in message.content
-        )
-        elapsed = time.monotonic() - start
-        text = response.message.content or ""
-        logger.info("Ollama call model=%s elapsed=%.2fs len_out=%d", model, elapsed, len(text))
-        _cache[key] = text
-        return text
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        logger.warning("Ollama call failed after %.2fs: %s", elapsed, exc)
-        raise
+    cfg = ProviderConfig(provider="ollama", model=model)
+    return get_llm_response(
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        config=cfg,
+        timeout=timeout,
+        cache_key=cache_key,
+    )

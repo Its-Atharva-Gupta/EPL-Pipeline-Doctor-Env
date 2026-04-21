@@ -3,13 +3,14 @@ import logging
 import pathlib
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models import ETLAction, ToolResult
 
 from .constants import OLLAMA_TIMEOUT
-from .llm_client import _cache_key, call_ollama
+from .llm_client import _cache_key, get_llm_response
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ _SYSTEM_PROMPT = (pathlib.Path(__file__).parent / "prompts" / "judge_system.md")
 
 
 class LLMJudge:
-    """Scores per-step reasoning quality using a local Ollama model."""
+    """Scores per-step reasoning quality using a configurable LLM provider."""
 
     def score(
         self,
@@ -25,14 +26,16 @@ class LLMJudge:
         compact_history: list[str],
         action: ETLAction,
         tool_result: ToolResult,
+        config: Any = None,  # ProviderConfig | None
     ) -> float:
         user_prompt = _build_user_prompt(alert, compact_history, action, tool_result)
         cache_key = _cache_key(_SYSTEM_PROMPT, user_prompt)
 
         try:
-            raw = call_ollama(
+            raw = get_llm_response(
                 system_prompt=_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                config=config,
                 timeout=OLLAMA_TIMEOUT,
                 cache_key=cache_key,
             )

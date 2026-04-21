@@ -1,10 +1,11 @@
 import json
 import logging
 import pathlib
+from typing import Any
 
 from .constants import FAULT_TYPES, KPI_TABLES, TIERS, WAREHOUSE_TABLES
 from .fault_catalogue import FaultSpec
-from .llm_client import call_ollama
+from .llm_client import get_llm_response
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +27,17 @@ class AdversarialDesigner:
         underused_tools: list[str],
         common_wrong_fix: str,
         current_tier: str,
+        config: Any = None,  # ProviderConfig | None
     ) -> FaultSpec | None:
         user_prompt = _build_designer_prompt(
             worst_fault_type, failure_rate, underused_tools, common_wrong_fix, current_tier
         )
         try:
-            raw = call_ollama(system_prompt=_SYSTEM_PROMPT, user_prompt=user_prompt)
+            raw = get_llm_response(
+                system_prompt=_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                config=config,
+            )
             return _parse_and_validate(raw)
         except Exception as exc:
             logger.warning("Adversarial designer failed: %s", exc)

@@ -2,6 +2,7 @@ import logging
 import random
 import sys
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
@@ -39,7 +40,7 @@ class EtlPipelineDoctorEnvironment(Environment):
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self) -> None:
+    def __init__(self, provider_config: Any = None) -> None:
         super().__init__()
         self._warehouse = Warehouse()
         self._fault_injector = FaultInjector(self._warehouse)
@@ -49,6 +50,7 @@ class EtlPipelineDoctorEnvironment(Environment):
         self._designer = AdversarialDesigner()
         self._curriculum = CurriculumController(self._catalogue, self._designer)
         self._rng = random.Random()
+        self._provider_config: Any = provider_config  # ProviderConfig | None
 
         # Per-episode state
         self._etl_state = ETLState()
@@ -58,6 +60,10 @@ class EtlPipelineDoctorEnvironment(Environment):
         self._tool_call_counts: dict[str, int] = {}
         self._current_alert: str = ""
         self._cumulative_reward: float = 0.0
+
+    def set_provider(self, config: Any) -> None:
+        """Set the LLM provider configuration used by the judge and designer."""
+        self._provider_config = config
 
     # ------------------------------------------------------------------
     # reset
@@ -69,7 +75,7 @@ class EtlPipelineDoctorEnvironment(Environment):
         ep_id = episode_id or str(uuid4())
 
         # Pick fault from curriculum
-        fault_spec = self._curriculum.pick_fault()
+        fault_spec = self._curriculum.pick_fault(self._provider_config)
 
         # Set up fresh warehouse
         self._warehouse.setup(seed=ep_seed)
@@ -179,6 +185,7 @@ class EtlPipelineDoctorEnvironment(Environment):
             compact_history=self._action_history[-5:],
             action=action,
             tool_result=tool_result,
+            config=self._provider_config,
         )
 
         # --- Compute reward ---

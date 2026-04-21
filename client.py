@@ -38,7 +38,9 @@ class ETLPipelineDoctorEnv:
     def state(self) -> ETLState:
         resp = self._session.get(f"{self.base_url}/state", timeout=10)
         resp.raise_for_status()
-        return ETLState(**resp.json())
+        data = resp.json()
+        data.pop("judge", None)  # server adds "judge" key; ETLState doesn't have it
+        return ETLState(**data)
 
     def close(self) -> None:
         self._session.close()

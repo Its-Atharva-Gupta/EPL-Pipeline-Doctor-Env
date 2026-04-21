@@ -1,6 +1,7 @@
 import logging
 import random
 from collections import deque
+from typing import Any
 
 from .adversarial_designer import AdversarialDesigner
 from .constants import (
@@ -36,10 +37,10 @@ class CurriculumController:
         self._episode_count = 0
         self._last_designer_episode = 0
 
-    def pick_fault(self) -> FaultSpec:
+    def pick_fault(self, config: Any = None) -> FaultSpec:
         """Sample a fault type (biased toward un-mastered) and return a scenario."""
         self._episode_count += 1
-        self._maybe_run_designer()
+        self._maybe_run_designer(config)
 
         # Bias sampling: weight by (1 - mastery)
         weights = [max(0.05, 1.0 - self._ema[ft]) for ft in FAULT_TYPES]
@@ -86,7 +87,7 @@ class CurriculumController:
             "tiers": {ft: TIERS[idx] for ft, idx in self._tier_idx.items()},
         }
 
-    def _maybe_run_designer(self) -> None:
+    def _maybe_run_designer(self, config: Any = None) -> None:
         """Run the adversarial designer every 20 episodes."""
         if self._episode_count - self._last_designer_episode < 20:
             return
@@ -104,6 +105,7 @@ class CurriculumController:
             underused_tools=[],
             common_wrong_fix="unknown",
             current_tier=tier,
+            config=config,
         )
         if spec:
             self._cat.add_scenario(spec)
