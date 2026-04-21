@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Dev tooling
+tests/
+.cursor/
+.vscode/
+CLAUDE.md
+.ruff_cache
+.pytest_cache
+
+
+# Python artifacts (also caught by defaults, but explicit is safe)
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+
+
+# Secrets
+.env
+.env.*
+
+# Logs & outputs
+*.log
+*.jsonl
+judge_scores.json
+eval_results.md
+eval_plot.png

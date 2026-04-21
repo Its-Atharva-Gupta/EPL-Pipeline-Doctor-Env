@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etl-pipeline-doctor"
+version = "0.1.0"
+description = "ETL Pipeline Doctor — RL environment for diagnosing and repairing broken data pipelines"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openenv-core[core]>=0.2.1",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "pandas>=2.2",
+    "pydantic>=2.0",
+    "ollama>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.4.0",
+]
+train = [
+    "trl>=0.29",
+    "peft>=0.10.0",
+    "transformers>=4.40.0",
+    "torch>=2.0.0",
+    "vllm>=0.4.0",
+    "accelerate>=0.28.0",
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.11",
+]

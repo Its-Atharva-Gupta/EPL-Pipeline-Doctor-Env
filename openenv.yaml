@@ -1,0 +1,7 @@
+spec_version: 1
+name: etl_pipeline_doctor
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+
