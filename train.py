@@ -12,8 +12,11 @@ from dotenv import load_dotenv
 from client import ETLPipelineDoctorEnv
 from models import ETLAction, ToolName, ProviderConfig
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
+# Suppress noisy loggers
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -185,8 +188,10 @@ def run_training(args: argparse.Namespace) -> None:
     def reward_fn(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
         """Call the env server to get rewards for each completion."""
         rewards = []
-        for completion in completions:
+        for i, completion in enumerate(completions):
             try:
+                # DEBUG: Log the raw completion to identify the source of malformed JSON
+                logger.debug(f"Completion {i}: {repr(completion[:200])}")
                 action_dict = json.loads(completion)
                 # Parse action_dict into ETLAction
                 tool_name = ToolName(action_dict.get("tool_name", "run_query"))
@@ -197,8 +202,11 @@ def run_training(args: argparse.Namespace) -> None:
                 )
                 obs = env.step(action)
                 rewards.append(float(obs.step_reward or 0.0))
+            except json.JSONDecodeError as exc:
+                logger.warning("JSON parse error on completion %d: %s | text: %r", i, exc, completion[:300])
+                rewards.append(-0.3)
             except Exception as exc:
-                logger.warning("Reward fn error: %s", exc)
+                logger.warning("Reward fn error on completion %d: %s", i, exc)
                 rewards.append(-0.3)
         return rewards
 
