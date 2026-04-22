@@ -52,16 +52,16 @@ def _build_user_prompt(
     tool_result: ToolResult,
 ) -> str:
     history_text = "\n".join(compact_history) if compact_history else "(none)"
+    cmd_short = action.command if len(action.command) <= 100 else action.command[:97] + "..."
     return (
         f"ALERT: {alert}\n"
         f"PRIOR ACTIONS:\n{history_text}\n"
         f"CURRENT ACTION:\n"
-        f"  Tool: {action.tool_name.value}\n"
-        f"  Args: {action.tool_args}\n"
-        f'  Agent reasoning: "{action.reasoning}"\n'
-        f"CURRENT TOOL RESULT: {tool_result.output[:500]}\n\n"
-        "Score the reasoning quality on a scale from -1.0 (irrational or regressive) "
-        "to +1.0 (textbook diagnosis). Return exactly this JSON and nothing else:\n"
+        f"  Command: {cmd_short}\n"
+        f"RESULT: {tool_result.output[:500]}\n"
+        f"Success: {'Yes' if tool_result.success else 'No'}\n\n"
+        "Score the command quality on a scale from -1.0 (irrational or breaks things) "
+        "to +1.0 (smart diagnostic step or correct fix). Return exactly this JSON:\n"
         '{"score": <float>, "brief": "<one-sentence justification>"}'
     )
 

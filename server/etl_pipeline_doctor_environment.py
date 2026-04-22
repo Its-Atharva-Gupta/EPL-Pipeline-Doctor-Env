@@ -9,7 +9,7 @@ from openenv.core.env_server.interfaces import Environment
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import ETLAction, ETLObservation, ETLState, ToolName, ToolResult
+from models import ETLAction, ETLObservation, ETLState, ToolResult
 
 from .adversarial_designer import AdversarialDesigner
 from .constants import KPI_TABLES, MAX_STEPS, WAREHOUSE_TABLES
@@ -141,25 +141,32 @@ class EtlPipelineDoctorEnvironment(Environment):
         self._etl_state.step += 1
         step = self._etl_state.step
 
-        # --- Execute tool ---
-        tool_result = self._dispatch_tool(action)
+        # --- Execute command ---
+        tool_result = self._tool_handlers.dispatch_command(action.command)
+
+        # --- Detect command type ---
+        cmd_upper = action.command.strip().upper()
+        is_mutation = cmd_upper.startswith(("UPDATE", "INSERT"))
+        is_trace = cmd_upper.startswith("TRACE")
+        is_verify = cmd_upper.startswith("VERIFY")
 
         # --- Track state for reward computation ---
-        tool_key = f"{action.tool_name.value}:{action.tool_args}"
-        repeated = self._tool_call_counts.get(tool_key, 0) > 0
-        self._tool_call_counts[tool_key] = self._tool_call_counts.get(tool_key, 0) + 1
+        command_key = action.command
+        repeat_count = self._tool_call_counts.get(command_key, 0)
+        repeated = repeat_count > 0
+        self._tool_call_counts[command_key] = repeat_count + 1
 
-        if action.tool_name == ToolName.TRACE_LINEAGE:
+        if is_trace:
             self._called_trace_lineage = True
 
         called_fix_without_lineage = (
-            action.tool_name == ToolName.APPLY_FIX and not self._called_trace_lineage
+            is_mutation and not self._called_trace_lineage
         )
-        malformed = not tool_result.success and action.tool_name != ToolName.VERIFY_OUTPUT
+        malformed = not tool_result.success and not is_verify
 
         # Check resolution
         resolved_this_step = False
-        if action.tool_name == ToolName.APPLY_FIX and tool_result.success:
+        if is_mutation and tool_result.success:
             verify = self._tool_handlers.verify_output(
                 self._fault_injector.active_faults[0]["affected_kpi"]
             )
@@ -168,15 +175,15 @@ class EtlPipelineDoctorEnvironment(Environment):
                 self._etl_state.resolved = True
 
         broke_something = (
-            action.tool_name == ToolName.APPLY_FIX and not tool_result.success and self._prev_kpi_ok
+            is_mutation and not tool_result.success and self._prev_kpi_ok
         )
 
-        wrong_fix = action.tool_name == ToolName.APPLY_FIX and not tool_result.success
+        wrong_fix = is_mutation and not tool_result.success
 
         step_progressed = (
             tool_result.success
             and not repeated
-            and action.tool_name not in (ToolName.VERIFY_OUTPUT,)
+            and not is_verify
         )
 
         # --- Judge score ---
@@ -200,6 +207,7 @@ class EtlPipelineDoctorEnvironment(Environment):
             called_apply_fix_without_lineage=called_fix_without_lineage,
             malformed_args=malformed,
             step_progressed=step_progressed,
+            action_repeat_count=repeat_count,
         )
 
         self._cumulative_reward += breakdown.total
@@ -225,11 +233,12 @@ class EtlPipelineDoctorEnvironment(Environment):
             )
 
         # Track KPI state for next step
-        if action.tool_name == ToolName.VERIFY_OUTPUT and tool_result.success:
+        if is_verify and tool_result.success:
             self._prev_kpi_ok = True
 
         # Build compact history entry
-        summary = f"[{step}] {action.tool_name.value}({action.tool_args}) → {'OK' if tool_result.success else 'FAIL'}"
+        cmd_short = action.command[:60] + "..." if len(action.command) > 60 else action.command
+        summary = f"[{step}] {cmd_short} → {'OK' if tool_result.success else 'FAIL'}"
         self._action_history.append(summary)
 
         diff_idx = self._etl_state.difficulty
@@ -365,27 +374,3 @@ class EtlPipelineDoctorEnvironment(Environment):
     # ------------------------------------------------------------------
     # tool dispatch
     # ------------------------------------------------------------------
-    def _dispatch_tool(self, action: ETLAction) -> ToolResult:
-        h = self._tool_handlers
-        args = action.tool_args
-        match action.tool_name:
-            case ToolName.RUN_QUERY:
-                return h.run_query(args.get("sql", ""))
-            case ToolName.INSPECT_SCHEMA:
-                return h.inspect_schema(args.get("table", ""))
-            case ToolName.CHECK_ROW_COUNTS:
-                return h.check_row_counts(args.get("table", ""))
-            case ToolName.TRACE_LINEAGE:
-                return h.trace_lineage(args.get("table", ""))
-            case ToolName.SAMPLE_ROWS:
-                return h.sample_rows(args.get("table", ""), args.get("n", 5))
-            case ToolName.APPLY_FIX:
-                return h.apply_fix(
-                    args.get("fix_type", ""),
-                    args.get("target", ""),
-                    args.get("params", {}),
-                )
-            case ToolName.VERIFY_OUTPUT:
-                return h.verify_output(args.get("kpi_name", ""))
-            case _:
-                return ToolResult(success=False, output=f"Unknown tool: {action.tool_name}")

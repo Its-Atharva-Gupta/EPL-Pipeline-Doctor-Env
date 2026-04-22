@@ -14,6 +14,12 @@ from .warehouse import Warehouse
 logger = logging.getLogger(__name__)
 
 _READ_ONLY_PATTERN = re.compile(r"\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE)\b", re.IGNORECASE)
+_DANGEROUS_PATTERNS = re.compile(r"\b(DROP|ALTER|CREATE)\b", re.IGNORECASE)
+
+
+class CommandParseError(Exception):
+    """Raised when command parsing fails."""
+    pass
 
 
 class ToolHandlers:
@@ -25,6 +31,88 @@ class ToolHandlers:
 
     def reset(self) -> None:
         self._fix_log = {}
+
+    def dispatch_command(self, command: str) -> ToolResult:
+        """Parse and dispatch a raw command to the appropriate handler.
+
+        Supported command formats:
+        - SELECT ... / SELECT * FROM ... (run_query)
+        - INSPECT TABLE <table> (inspect_schema)
+        - CHECK_ROWS <table> (check_row_counts)
+        - TRACE <table> (trace_lineage)
+        - SAMPLE <table> [n] (sample_rows)
+        - UPDATE ... / INSERT ... (mutations, routed to apply_fix)
+        - VERIFY (verify_output)
+        """
+        cmd = command.strip()
+        if not cmd:
+            return ToolResult(success=False, output="Empty command")
+
+        # Route based on command prefix/keyword
+        cmd_upper = cmd.upper()
+
+        # SELECT (read-only query)
+        if cmd_upper.startswith("SELECT"):
+            return self.run_query(cmd)
+
+        # INSPECT TABLE <table>
+        if cmd_upper.startswith("INSPECT"):
+            match = re.match(r"INSPECT\s+TABLE\s+(\S+)", cmd, re.IGNORECASE)
+            if not match:
+                return ToolResult(success=False, output="INSPECT usage: INSPECT TABLE <table>")
+            table = match.group(1)
+            return self.inspect_schema(table)
+
+        # CHECK_ROWS <table>
+        if cmd_upper.startswith("CHECK"):
+            match = re.match(r"CHECK\s+(?:ROWS\s+)?(\S+)", cmd, re.IGNORECASE)
+            if not match:
+                return ToolResult(success=False, output="CHECK usage: CHECK <table> or CHECK ROWS <table>")
+            table = match.group(1)
+            return self.check_row_counts(table)
+
+        # TRACE <table>
+        if cmd_upper.startswith("TRACE"):
+            match = re.match(r"TRACE\s+(?:LINEAGE\s+)?(\S+)", cmd, re.IGNORECASE)
+            if not match:
+                return ToolResult(success=False, output="TRACE usage: TRACE <table> or TRACE LINEAGE <table>")
+            table = match.group(1)
+            return self.trace_lineage(table)
+
+        # SAMPLE <table> [n]
+        if cmd_upper.startswith("SAMPLE"):
+            match = re.match(r"SAMPLE\s+(\S+)(?:\s+(\d+))?", cmd, re.IGNORECASE)
+            if not match:
+                return ToolResult(success=False, output="SAMPLE usage: SAMPLE <table> [n]")
+            table = match.group(1)
+            n = int(match.group(2)) if match.group(2) else 5
+            return self.sample_rows(table, n)
+
+        # VERIFY (verify_output)
+        if cmd_upper.startswith("VERIFY"):
+            return self.verify_output(self._wh.lineage_graph.get("kpi", "gold.kpi_daily_revenue") if hasattr(self._wh, 'lineage_graph') else "gold.kpi_daily_revenue")
+
+        # UPDATE / INSERT (mutations)
+        if cmd_upper.startswith("UPDATE") or cmd_upper.startswith("INSERT"):
+            return self._handle_mutation(cmd)
+
+        # DROP / ALTER / CREATE (dangerous)
+        if _DANGEROUS_PATTERNS.search(cmd):
+            return ToolResult(success=False, output="Dangerous operations (DROP, ALTER, CREATE) are not allowed")
+
+        return ToolResult(success=False, output=f"Unknown command format. Valid: SELECT, INSPECT, CHECK, TRACE, SAMPLE, VERIFY, UPDATE, INSERT")
+
+    def _handle_mutation(self, sql: str) -> ToolResult:
+        """Execute a mutation (UPDATE/INSERT) safely."""
+        if _DANGEROUS_PATTERNS.search(sql):
+            return ToolResult(success=False, output="Dangerous operations (DROP, ALTER, CREATE) are not allowed")
+
+        try:
+            self._wh.conn.executescript(sql)
+            self._wh.conn.commit()
+            return ToolResult(success=True, output=f"Mutation executed successfully")
+        except sqlite3.Error as exc:
+            return ToolResult(success=False, output=str(exc))
 
     # ------------------------------------------------------------------
     # 9.1 run_query

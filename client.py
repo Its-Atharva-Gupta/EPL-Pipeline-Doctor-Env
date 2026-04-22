@@ -95,3 +95,24 @@ class ETLPipelineDoctorEnv:
 
     def __exit__(self, *_: Any) -> None:
         self.close()
+
+
+# Example usage helper
+def example_commands() -> None:
+    """Print example commands for the agent."""
+    examples = """
+    # Exploration commands:
+    SELECT * FROM gold_kpi_daily_revenue ORDER BY date DESC LIMIT 5
+    INSPECT TABLE silver.orders_enriched
+    CHECK ROWS gold.kpi_daily_revenue
+    TRACE LINEAGE silver.orders_enriched
+    SAMPLE silver.daily_sales 10
+
+    # Mutation commands:
+    UPDATE silver_orders_enriched SET region = COALESCE(region, 'UNKNOWN') WHERE region IS NULL
+    INSERT INTO silver_daily_sales SELECT date, region, SUM(total_amount), COUNT(*) FROM silver_orders_enriched GROUP BY date, region
+
+    # Verification:
+    VERIFY
+    """
+    print(examples)

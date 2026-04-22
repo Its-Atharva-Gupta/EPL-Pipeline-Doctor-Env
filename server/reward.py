@@ -42,6 +42,7 @@ def compute_step_reward(
     called_apply_fix_without_lineage: bool,
     malformed_args: bool,
     step_progressed: bool,
+    action_repeat_count: int = 0,
 ) -> RewardBreakdown:
     # r_outcome
     if resolved_this_step:
@@ -59,7 +60,9 @@ def compute_step_reward(
     if step_progressed:
         r_efficiency += 0.1
     if repeated_tool_call:
-        r_efficiency -= 0.1
+        # Penalize repeated actions with increasing severity
+        # 1st repeat: -0.1, 2nd repeat: -0.2, 3rd repeat: -0.3, etc.
+        r_efficiency -= 0.1 * action_repeat_count
     if wrong_fix_type:
         r_efficiency -= 0.2
 

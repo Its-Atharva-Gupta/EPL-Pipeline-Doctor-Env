@@ -16,9 +16,7 @@ class ToolName(StrEnum):
 
 
 class ETLAction(Action):
-    tool_name: ToolName
-    tool_args: dict = Field(default_factory=dict)
-    reasoning: str = Field(..., description="Agent's thought process, read by LLM judge")
+    command: str = Field(..., description="SQL command or tool invocation (e.g., 'SELECT ...', 'INSPECT TABLE silver.orders_enriched', 'FIX coalesce_column silver.orders_enriched region UNKNOWN')")
 
 
 class ToolResult(Action):

@@ -34,7 +34,7 @@ from typing import Any
 
 from server.etl_pipeline_doctor_environment import EtlPipelineDoctorEnvironment
 from server.llm_judge import LLMJudge
-from models import ETLAction, ToolName
+from models import ETLAction, ToolResult
 
 
 GREEN = "\033[92m"
@@ -83,29 +83,23 @@ def build_judge_probes() -> list[JudgeProbe]:
         JudgeProbe(
             "good", alert, [],
             ETLAction(
-                tool_name=ToolName.TRACE_LINEAGE,
-                tool_args={"table": "gold.kpi_daily_revenue"},
-                reasoning="KPI is zero. Before inspecting data, I need to map which upstream tables feed this KPI so I can systematically narrow down where the fault sits.",
+                command="TRACE LINEAGE gold.kpi_daily_revenue",
             ),
             "Upstream: ['silver.daily_sales']. Downstream: []",
         ),
         JudgeProbe(
             "good", alert,
-            ["[1] trace_lineage(gold.kpi_daily_revenue) -> Upstream: silver.daily_sales"],
+            ["[1] TRACE LINEAGE gold.kpi_daily_revenue -> Upstream: silver.daily_sales"],
             ETLAction(
-                tool_name=ToolName.CHECK_ROW_COUNTS,
-                tool_args={"table": "silver.daily_sales"},
-                reasoning="Lineage points to silver.daily_sales. A zero KPI could mean rows are missing for recent dates. Row counts by partition will confirm staleness vs content issue.",
+                command="CHECK ROWS silver.daily_sales",
             ),
             "Row count: 870. Last partition: 2026-04-18 (3 days ago). Expected most recent: 2026-04-21.",
         ),
         JudgeProbe(
             "good", alert,
-            ["[1] trace_lineage(silver.daily_sales)", "[2] check_row_counts -> stale, last partition 3 days old"],
+            ["[1] TRACE LINEAGE silver.daily_sales", "[2] CHECK ROWS -> stale, last partition 3 days old"],
             ETLAction(
-                tool_name=ToolName.INSPECT_SCHEMA,
-                tool_args={"table": "silver.orders_enriched"},
-                reasoning="Silver is stale. Checking schema of its upstream source to see if a schema change broke the refresh job rather than assuming it's a pure partition issue.",
+                command="INSPECT TABLE silver.orders_enriched",
             ),
             "Columns: order_id, customer_id, order_date, order_total (was total_amount), product_count, region",
         ),
@@ -113,9 +107,7 @@ def build_judge_probes() -> list[JudgeProbe]:
             "good", alert,
             ["[1-3] lineage + row counts + schema inspect -> schema drift total_amount -> order_total"],
             ETLAction(
-                tool_name=ToolName.APPLY_FIX,
-                tool_args={"fix_type": "rename_column", "target": "silver.orders_enriched", "params": {"old": "total_amount", "new": "order_total"}},
-                reasoning="Confirmed: column was renamed upstream. Applying rename to downstream transform so aggregation references the new column name.",
+                command="UPDATE silver_orders_enriched SET order_total = total_amount WHERE order_total IS NULL",
             ),
             "Fix applied. silver.orders_enriched now uses order_total.",
         ),
@@ -125,37 +117,29 @@ def build_judge_probes() -> list[JudgeProbe]:
         JudgeProbe(
             "neutral", alert, [],
             ETLAction(
-                tool_name=ToolName.INSPECT_SCHEMA,
-                tool_args={"table": "gold.kpi_daily_revenue"},
-                reasoning="Looking at the schema of the KPI table.",
+                command="INSPECT TABLE gold.kpi_daily_revenue",
             ),
             "Columns: date, revenue, yoy_growth_pct",
         ),
         JudgeProbe(
             "neutral", alert, [],
             ETLAction(
-                tool_name=ToolName.SAMPLE_ROWS,
-                tool_args={"table": "bronze.orders_raw", "n": 5},
-                reasoning="Sampling rows from bronze.",
+                command="SAMPLE bronze.orders_raw 5",
             ),
             "5 rows sampled.",
         ),
         JudgeProbe(
             "neutral", alert,
-            ["[1] inspect_schema(gold.kpi_daily_revenue)"],
+            ["[1] INSPECT TABLE gold.kpi_daily_revenue"],
             ETLAction(
-                tool_name=ToolName.RUN_QUERY,
-                tool_args={"sql": "SELECT COUNT(*) FROM bronze.orders_raw"},
-                reasoning="Counting rows in bronze.",
+                command="SELECT COUNT(*) FROM bronze_orders_raw",
             ),
             "count: 6200",
         ),
         JudgeProbe(
             "neutral", alert, [],
             ETLAction(
-                tool_name=ToolName.RUN_QUERY,
-                tool_args={"sql": "SELECT * FROM bronze.products_raw LIMIT 3"},
-                reasoning="Looking at products.",
+                command="SELECT * FROM bronze_products_raw LIMIT 3",
             ),
             "3 rows.",
         ),
@@ -165,40 +149,32 @@ def build_judge_probes() -> list[JudgeProbe]:
         JudgeProbe(
             "bad", alert, [],
             ETLAction(
-                tool_name=ToolName.APPLY_FIX,
-                tool_args={"fix_type": "custom_sql", "target": "bronze.orders_raw", "params": {"sql": "DELETE FROM bronze.orders_raw"}},
-                reasoning="Let me just clear the table.",
+                command="DELETE FROM bronze_orders_raw WHERE 1=1",
             ),
-            "Fix applied.",
+            "Error: DELETE operations blocked.",
         ),
         JudgeProbe(
             "bad", alert,
-            ["[1] inspect_schema(gold.kpi_daily_revenue)", "[2] inspect_schema(gold.kpi_daily_revenue)"],
+            ["[1] INSPECT TABLE gold.kpi_daily_revenue", "[2] INSPECT TABLE gold.kpi_daily_revenue"],
             ETLAction(
-                tool_name=ToolName.INSPECT_SCHEMA,
-                tool_args={"table": "gold.kpi_daily_revenue"},
-                reasoning="Inspecting the schema again.",
+                command="INSPECT TABLE gold.kpi_daily_revenue",
             ),
             "Columns: date, revenue, yoy_growth_pct (same as before)",
         ),
         JudgeProbe(
             "bad", alert,
-            ["[1] check_row_counts(silver.daily_sales) -> stale 3 days"],
+            ["[1] CHECK ROWS silver.daily_sales -> stale 3 days"],
             ETLAction(
-                tool_name=ToolName.APPLY_FIX,
-                tool_args={"fix_type": "coalesce_column", "target": "silver.daily_sales", "params": {"column": "region", "default": "X"}},
-                reasoning="Applying a coalesce fix.",
+                command="UPDATE silver_daily_sales SET region = 'X' WHERE region IS NULL",
             ),
             "Fix applied.",
         ),
         JudgeProbe(
             "bad", alert, [],
             ETLAction(
-                tool_name=ToolName.APPLY_FIX,
-                tool_args={"fix_type": "rename_column", "target": "bronze.orders_raw", "params": {"old": "x", "new": "y"}},
-                reasoning="Try a fix.",
+                command="UPDATE bronze_orders_raw SET nonexistent_column = 1",
             ),
-            "Error: column x does not exist.",
+            "Error: column nonexistent_column does not exist.",
         ),
     ]
 
@@ -301,12 +277,11 @@ def check_textbook_fixes() -> bool:
             continue
 
         state = env.get_state()
-        correct_fix = env.get_canonical_fix_for_current_fault()
+        # Get fix command for current fault
+        fix_command = env.get_canonical_fix_command_for_current_fault()
 
         fix_action = ETLAction(
-            tool_name=ToolName.APPLY_FIX,
-            tool_args=correct_fix,
-            reasoning=f"Applying the canonical fix for {fault_type}.",
+            command=fix_command,
         )
 
         step_result = env.step(fix_action)
@@ -332,29 +307,19 @@ def check_episode_latency() -> bool:
 
     scripted_actions = [
         ETLAction(
-            tool_name=ToolName.TRACE_LINEAGE,
-            tool_args={"table": "gold.kpi_daily_revenue"},
-            reasoning="Start with lineage.",
+            command="TRACE LINEAGE gold.kpi_daily_revenue",
         ),
         ETLAction(
-            tool_name=ToolName.CHECK_ROW_COUNTS,
-            tool_args={"table": "silver.daily_sales"},
-            reasoning="Check counts on upstream.",
+            command="CHECK ROWS silver.daily_sales",
         ),
         ETLAction(
-            tool_name=ToolName.INSPECT_SCHEMA,
-            tool_args={"table": "silver.orders_enriched"},
-            reasoning="Inspect schema.",
+            command="INSPECT TABLE silver.orders_enriched",
         ),
         ETLAction(
-            tool_name=ToolName.SAMPLE_ROWS,
-            tool_args={"table": "bronze.orders_raw", "n": 5},
-            reasoning="Sample bronze.",
+            command="SAMPLE bronze.orders_raw 5",
         ),
         ETLAction(
-            tool_name=ToolName.RUN_QUERY,
-            tool_args={"sql": "SELECT COUNT(*) FROM bronze.orders_raw"},
-            reasoning="Count.",
+            command="SELECT COUNT(*) FROM bronze_orders_raw",
         ),
     ]
 
