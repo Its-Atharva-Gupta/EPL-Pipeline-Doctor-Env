@@ -4,8 +4,8 @@ library_name: transformers
 model_name: grpo-output
 tags:
 - generated_from_trainer
-- grpo
 - trl
+- grpo
 licence: license
 ---
 

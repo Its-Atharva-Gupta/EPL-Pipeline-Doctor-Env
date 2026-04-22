@@ -49,8 +49,14 @@ MAX_STEPS: Final[int] = 20
 
 # Reward weights
 W_OUTCOME: Final[float] = 0.5
-W_REASONING: Final[float] = 0.3
-W_EFFICIENCY: Final[float] = 0.2
+W_REASONING: Final[float] = 0.15
+W_EFFICIENCY: Final[float] = 0.15
+W_PROGRESS: Final[float] = 0.2
+
+# Dense progress reward parameters
+R_PROGRESS_KPI_WEIGHT: Final[float] = 0.6
+R_PROGRESS_FAULT_WEIGHT: Final[float] = 0.4
+R_PROGRESS_DELTA_CLIP: Final[float] = 1.0
 
 # Terminal rewards
 R_TERMINAL_SUCCESS: Final[float] = 3.0

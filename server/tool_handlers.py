@@ -33,6 +33,9 @@ class ToolHandlers:
         self._fix_log = {}
 
     def dispatch_command(self, command: str) -> ToolResult:
+        return self.dispatch_command_with_defaults(command)
+
+    def dispatch_command_with_defaults(self, command: str, *, default_kpi: str = "gold.kpi_daily_revenue") -> ToolResult:
         """Parse and dispatch a raw command to the appropriate handler.
 
         Supported command formats:
@@ -90,7 +93,7 @@ class ToolHandlers:
 
         # VERIFY (verify_output)
         if cmd_upper.startswith("VERIFY"):
-            return self.verify_output(self._wh.lineage_graph.get("kpi", "gold.kpi_daily_revenue") if hasattr(self._wh, 'lineage_graph') else "gold.kpi_daily_revenue")
+            return self.verify_output(default_kpi)
 
         # UPDATE / INSERT (mutations)
         if cmd_upper.startswith("UPDATE") or cmd_upper.startswith("INSERT"):
@@ -361,7 +364,7 @@ class ToolHandlers:
         try:
             # Strip corruption suffix and recast to numeric
             self._wh.conn.execute(
-                f"UPDATE {sql_name} SET {column} = CAST(REPLACE({column}, '_corrupted', '') AS {to_type})"
+                f"UPDATE {sql_name} SET {column} = CAST(REPLACE(REPLACE({column}, 'corrupted_', ''), '_corrupted', '') AS {to_type})"
             )
             self._wh.conn.commit()
             return ToolResult(success=True, output=f"Recast {column} to {to_type} in {target}")

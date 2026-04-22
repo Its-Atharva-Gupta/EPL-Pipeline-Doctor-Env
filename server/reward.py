@@ -10,10 +10,14 @@ from models import ETLAction, ToolResult
 from .constants import (
     R_EFFICIENCY_PER_EXTRA_STEP,
     R_EFFICIENCY_STEP_BONUS_START,
+    R_PROGRESS_DELTA_CLIP,
+    R_PROGRESS_FAULT_WEIGHT,
+    R_PROGRESS_KPI_WEIGHT,
     R_TERMINAL_SUCCESS,
     R_TERMINAL_TIMEOUT,
     W_EFFICIENCY,
     W_OUTCOME,
+    W_PROGRESS,
     W_REASONING,
 )
 
@@ -26,9 +30,18 @@ class RewardBreakdown:
     reasoning: float = 0.0
     efficiency: float = 0.0
     penalty: float = 0.0
+    progress: float = 0.0
     total: float = 0.0
     terminal: float = 0.0
     details: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class DenseProgress:
+    kpi_proximity: float = 0.0
+    fault_progress: float = 0.0
+    kpi_delta: float = 0.0
+    fault_delta: float = 0.0
 
 
 def compute_step_reward(
@@ -43,6 +56,7 @@ def compute_step_reward(
     malformed_args: bool,
     step_progressed: bool,
     action_repeat_count: int = 0,
+    dense_progress: DenseProgress | None = None,
 ) -> RewardBreakdown:
     # r_outcome
     if resolved_this_step:
@@ -66,6 +80,15 @@ def compute_step_reward(
     if wrong_fix_type:
         r_efficiency -= 0.2
 
+    # r_progress — dense per-step improvement signal
+    r_progress = 0.0
+    if dense_progress is not None:
+        raw_progress = (
+            R_PROGRESS_KPI_WEIGHT * dense_progress.kpi_delta
+            + R_PROGRESS_FAULT_WEIGHT * dense_progress.fault_delta
+        )
+        r_progress = max(-R_PROGRESS_DELTA_CLIP, min(R_PROGRESS_DELTA_CLIP, raw_progress))
+
     # r_penalty
     r_penalty = 0.0
     if called_apply_fix_without_lineage:
@@ -74,7 +97,11 @@ def compute_step_reward(
         r_penalty -= 0.3
 
     total = (
-        W_OUTCOME * r_outcome + W_REASONING * r_reasoning + W_EFFICIENCY * r_efficiency + r_penalty
+        W_OUTCOME * r_outcome
+        + W_REASONING * r_reasoning
+        + W_EFFICIENCY * r_efficiency
+        + W_PROGRESS * r_progress
+        + r_penalty
     )
 
     bd = RewardBreakdown(
@@ -82,12 +109,18 @@ def compute_step_reward(
         reasoning=r_reasoning,
         efficiency=r_efficiency,
         penalty=r_penalty,
+        progress=r_progress,
         total=total,
         details={
             "r_outcome": r_outcome,
             "r_reasoning": r_reasoning,
             "r_efficiency": r_efficiency,
             "r_penalty": r_penalty,
+            "r_progress": r_progress,
+            "kpi_proximity": dense_progress.kpi_proximity if dense_progress else 0.0,
+            "fault_progress": dense_progress.fault_progress if dense_progress else 0.0,
+            "kpi_delta": dense_progress.kpi_delta if dense_progress else 0.0,
+            "fault_delta": dense_progress.fault_delta if dense_progress else 0.0,
         },
     )
     return bd

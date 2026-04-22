@@ -13,6 +13,10 @@ def _cache_key(*parts: str) -> str:
     combined = "\x00".join(parts)
     return hashlib.sha256(combined.encode()).hexdigest()
 
+def cache_has(key: str) -> bool:
+    """Debug helper: check if an LLM response is cached for this key."""
+    return key in _cache
+
 
 def get_llm_response(
     user_prompt: str,

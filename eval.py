@@ -88,9 +88,10 @@ def _model_action(model, tokenizer, obs: dict) -> dict:
     """Generate action from a loaded HF model."""
     import torch
 
-    from train import _build_prompt
+    from models import ETLObservation
+    from train import build_prompt
 
-    prompt = _build_prompt(obs)
+    prompt = build_prompt(tokenizer, ETLObservation(**obs))
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         output = model.generate(**inputs, max_new_tokens=256, do_sample=False)

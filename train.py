@@ -1,478 +1,563 @@
-"""GRPO training entry point for ETL Pipeline Doctor."""
+"""GRPO training entry point for ETL Pipeline Doctor.
+
+This trains the *agent* (HF model) to output a single valid command per step.
+The environment server uses a separate provider-configured LLM for judging
+reasoning quality and (optionally) adversarial curriculum design.
+"""
+
+from __future__ import annotations
 
 import argparse
-import csv
-import json
 import logging
-import threading
-from datetime import datetime
-from pathlib import Path
-
 import os
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
 import requests
 from dotenv import load_dotenv
+
 from client import ETLPipelineDoctorEnv
-from models import ETLAction, ProviderConfig
-
-# GPU Memory optimization (critical for TRL + colocate mode on 80GB)
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
-
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
-logger = logging.getLogger(__name__)
-# Suppress noisy loggers
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+from models import ETLAction, ETLObservation, ProviderConfig
 
 load_dotenv()
 
-TRAIN_CONFIG = {
-    "model_id": "Qwen/Qwen3-0.6B",
-    "algorithm": "GRPO",
-    "lora_r": 16,
-    "lora_alpha": 32,
-    "lora_dropout": 0.05,
-    "num_generations": 4,
-    "max_steps": 200,
-    "per_device_train_batch_size": 1,  # Keep 1, use gradient_accumulation for effective batch
-    "gradient_accumulation_steps": 8,  # Effective batch = 8 (Kube best practice)
-    "learning_rate": 5e-6,
-    "max_prompt_length": 1024,
-    "max_completion_length": 256,
-    "save_steps": 50,
-    "env_base_url": "http://localhost:8000",
-    "max_turns": 20,  # Max env.step() calls per episode
-}
+# GPU Memory / allocator tuning (helpful for TRL + LoRA on large models).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
-SYSTEM_PROMPT = """You are a data engineer diagnosing a broken ETL pipeline.
+# LLM judge/provider rate-limit protection (server-side provider calls).
+os.environ.setdefault("LLM_MIN_INTERVAL_S", "0.25")  # 250ms minimum spacing between calls
+os.environ.setdefault("LLM_MAX_CONCURRENCY", "2")
+os.environ.setdefault("LLM_MAX_RETRIES", "6")
+os.environ.setdefault("LLM_BACKOFF_BASE_S", "0.5")
+os.environ.setdefault("LLM_BACKOFF_JITTER_MAX_S", "0.25")
+os.environ.setdefault("LLM_MAX_BACKOFF_S", "30")
 
-Output ONE command per turn. No explanations, no markdown, no prefixes.
-
-Available commands:
-- SELECT ... FROM ...              — read-only SQL queries
-- INSPECT TABLE <table>            — get schema + null counts
-- CHECK <table> / CHECK ROWS <table> — row counts by date
-- TRACE <table> / TRACE LINEAGE <table> — upstream/downstream dependencies
-- SAMPLE <table> [n]               — sample n random rows
-- UPDATE ... WHERE ...             — apply a fix (mutation)
-- INSERT INTO ... SELECT ...       — insert data (mutation)
-- VERIFY                           — compare KPI to expected value
-
-IMPORTANT: If a command fails, try a different approach. Do NOT repeat the same command more than once."""
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+logger = logging.getLogger("train")
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def format_observation(obs) -> str:
-    """Format observation into agent-readable text."""
-    alert = getattr(obs, "alert", "") or ""
-    last_output = getattr(obs, "last_tool_output", "") or "(none)"
-    step = getattr(obs, "step", 0)
-    max_steps = getattr(obs, "max_steps", 20)
+# ---------------------------------------------------------------------------
+# Training defaults
+# ---------------------------------------------------------------------------
 
-    return f"""{alert}
-
-Last command output:
-{last_output}
-
-Step {step}/{max_steps}. Diagnose and fix this issue."""
+DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 
 
-def format_history(history: list[dict]) -> str:
-    """Format action history into condensed summary."""
-    if not history:
-        return ""
-    lines = ["PREVIOUS COMMANDS AND RESULTS:"]
-    for entry in history:
-        cmd = entry.get("command", "")
-        output = entry.get("output", "")
-        reward = entry.get("reward", 0.0)
-        if len(output) > 200:
-            output = output[:200] + "... (truncated)"
-        lines.append(f"$ {cmd}")
-        lines.append(f"  Output: {output}")
-        lines.append(f"  Reward: {reward:.2f}")
-    return "\n".join(lines)
+@dataclass(frozen=True)
+class TrainDefaults:
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+
+    num_generations: int = 4
+    max_steps: int = 200
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 5e-6
+
+    max_prompt_length: int = 1024
+    max_completion_length: int = 256
+
+    save_steps: int = 50
+    env_base_url: str = "http://localhost:8000"
+
+    # Environment episode max steps (server-side constant is also 20).
+    max_turns: int = 20
 
 
-def apply_chat_template(tokenizer, messages):
-    """Apply chat template with fallback for older tokenizers."""
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+DEFAULTS = TrainDefaults()
 
 
-def parse_commands(text: str) -> list[str]:
-    """Extract commands from agent response (max 2 per turn to prevent spam)."""
-    commands = []
-    seen = set()
-    for line in text.strip().split("\n"):
-        line = line.strip()
-        # Accept SQL, trace, inspect, check, verify, sample commands
-        if line.upper().startswith(("SELECT ", "UPDATE ", "INSERT ", "VERIFY", "TRACE ", "INSPECT ", "CHECK ", "SAMPLE ")):
-            if line not in seen:
-                commands.append(line)
-                seen.add(line)
-        if len(commands) >= 2:
-            break
-    return commands
+SYSTEM_INSTRUCTIONS = """You are a data engineer diagnosing a broken ETL pipeline.
+
+Output EXACTLY ONE command per turn. No explanations, no markdown, no prefixes.
+
+Valid commands:
+- SELECT ... FROM ...                 (read-only SQL query)
+- INSPECT TABLE <table>               (schema + null counts)
+- CHECK <table> / CHECK ROWS <table>  (row counts by date)
+- TRACE <table> / TRACE LINEAGE <table> (dependencies)
+- SAMPLE <table> [n]                  (sample rows)
+- UPDATE ... WHERE ...                (mutation)
+- INSERT INTO ... SELECT ...           (mutation)
+- VERIFY                              (compare KPI to expected value)
+
+If a command fails, try a different approach. Do NOT repeat the same command more than once.
+"""
 
 
-def _build_prompt(obs_dict: dict) -> str:
-    """Convert an ETLObservation dict into a chat-formatted prompt."""
-    alert = obs_dict.get("alert", "")
-    tables = obs_dict.get("available_tables", [])
-    kpis = obs_dict.get("available_kpis", [])
-    history = obs_dict.get("action_history", [])
-    last_output = obs_dict.get("last_tool_output") or "(none)"
+# ---------------------------------------------------------------------------
+# Prompting + parsing
+# ---------------------------------------------------------------------------
 
-    history_text = "\n".join(history[-5:]) if history else "(none)"
-    commands_doc = """Available commands (raw SQL):
-- SELECT ... FROM ...              — read-only SQL queries
-- INSPECT TABLE <table>            — get schema + null counts
-- CHECK <table> / CHECK ROWS <table> — row counts by date
-- TRACE <table> / TRACE LINEAGE <table> — upstream/downstream dependencies
-- SAMPLE <table> [n]               — sample n random rows
-- UPDATE ... WHERE ...             — apply a fix (mutation)
-- INSERT INTO ... SELECT ...       — insert data (mutation)
-- VERIFY                           — compare KPI to expected value
 
-Examples:
-  SELECT * FROM gold_kpi_daily_revenue LIMIT 5
-  INSPECT TABLE silver.orders_enriched
-  CHECK ROWS silver.daily_sales
-  TRACE LINEAGE gold.kpi_daily_revenue
-  SAMPLE bronze.orders_raw 10
-  UPDATE silver_orders_enriched SET region = COALESCE(region, 'UNKNOWN') WHERE region IS NULL
-  VERIFY"""
+def _format_obs_for_user(obs: ETLObservation) -> str:
+    history = obs.action_history[-5:] if obs.action_history else []
+    history_text = "\n".join(history) if history else "(none)"
+    last_output = obs.last_tool_output or "(none)"
 
     return (
-        f"You are a data engineer diagnosing a broken ETL pipeline.\n\n"
-        f"ALERT: {alert}\n\n"
-        f"Available tables: {tables}\n"
-        f"KPIs to monitor: {kpis}\n\n"
-        f"{commands_doc}\n\n"
+        f"EPISODE_ID: {obs.episode_id}\n"
+        f"ALERT: {obs.alert}\n\n"
+        f"Available tables: {obs.available_tables}\n"
+        f"KPIs to monitor: {obs.available_kpis}\n\n"
         f"Recent action history:\n{history_text}\n\n"
         f"Last tool output:\n{last_output}\n\n"
         "OUTPUT ONLY ONE COMMAND. NO JSON. NO EXPLANATION. JUST THE COMMAND.\n"
-        "Examples: SELECT * FROM gold_kpi_daily_revenue\n"
-        "         TRACE LINEAGE gold.kpi_daily_revenue\n"
-        "         UPDATE silver_orders_enriched SET region = COALESCE(region, 'UNKNOWN') WHERE region IS NULL"
     )
 
 
-def _start_server_background() -> threading.Thread:
-    """Start the env server in a background thread (for smoke tests)."""
+def _apply_chat_template(tokenizer: Any, messages: list[dict[str, str]]) -> str:
+    """Apply model-specific chat template with a safe fallback."""
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+
+    # Fallback for non-chat tokenizers.
+    parts: list[str] = []
+    for m in messages:
+        role = m.get("role", "user").upper()
+        content = m.get("content", "")
+        parts.append(f"{role}:\n{content}")
+    parts.append("ASSISTANT:\n")
+    return "\n\n".join(parts)
+
+
+def build_prompt(tokenizer: Any, obs: ETLObservation) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+        {"role": "user", "content": _format_obs_for_user(obs)},
+    ]
+    return _apply_chat_template(tokenizer, messages)
+
+
+def extract_first_command(text: str) -> str | None:
+    """Extract the first valid command line from a model completion."""
+    if not text:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        up = line.upper()
+        if up.startswith(
+            (
+                "SELECT ",
+                "UPDATE ",
+                "INSERT ",
+                "VERIFY",
+                "TRACE ",
+                "INSPECT ",
+                "CHECK ",
+                "SAMPLE ",
+            )
+        ):
+            return line
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Server management + provider configuration
+# ---------------------------------------------------------------------------
+
+
+def _is_server_healthy(base_url: str) -> bool:
+    try:
+        r = requests.get(f"{base_url.rstrip('/')}/healthz", timeout=2)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def ensure_server_running(base_url: str) -> None:
+    """Ensure the FastAPI/OpenEnv server is running (starts uvicorn if needed)."""
+    if _is_server_healthy(base_url):
+        return
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    port = parsed.port or 8000
+
+    logger.info("Starting env server in a background thread...")
     import uvicorn
 
     from server.app import app
 
-    def _run():
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    def _run() -> None:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    import time
+    threading.Thread(target=_run, daemon=True).start()
 
-    time.sleep(2)
-    return t
+    deadline = time.time() + 25.0
+    while time.time() < deadline:
+        if _is_server_healthy(base_url):
+            logger.info("✓ Env server is healthy at %s", base_url)
+            return
+        time.sleep(0.25)
+
+    raise RuntimeError(f"Env server failed health check at {base_url}")
 
 
-def configure_llm_provider(base_url: str = "http://localhost:8000") -> None:
-    """Configure the LLM provider (OpenAI by default)."""
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
+def configure_judge_provider(
+    base_url: str,
+    *,
+    provider: str,
+    model: str,
+    api_key_env: str,
+    provider_base_url: str = "",
+) -> None:
+    """Configure the server-side judge/adversary provider via POST /configure."""
+    api_key = os.getenv(api_key_env, "")
+    if not api_key and provider not in ("ollama",):
         logger.warning(
-            "OPENAI_API_KEY not set. Judge will not be available. "
-            "Set OPENAI_API_KEY environment variable to enable LLM judge."
+            "%s not set; judge/designer LLM may fail (provider=%s).", api_key_env, provider
         )
-        return
 
     config = ProviderConfig(
-        provider="groq",
-        model="llama-3.3-70b-versatile",
+        provider=provider,  # type: ignore[arg-type]
+        model=model,
         api_key=api_key,
+        base_url=provider_base_url,
     )
 
     try:
-        response = requests.post(
-            f"{base_url}/configure",
+        resp = requests.post(
+            f"{base_url.rstrip('/')}/configure",
             json=config.model_dump(),
             timeout=15,
         )
-        response.raise_for_status()
-        logger.info("✓ LLM provider configured: Groq (llama-3.3-70b-versatile)")
+        resp.raise_for_status()
+        logger.info("✓ Judge provider configured: %s (%s)", provider, model)
     except requests.RequestException as exc:
-        logger.warning("Failed to configure LLM provider: %s", exc)
-        logger.warning("Training will continue but judgment rewards will not be available.")
+        logger.warning("Failed to configure judge provider: %s", exc)
+        logger.warning("Training may fail if the server cannot call its judge/designer LLM.")
 
 
-def run_dry_run() -> None:
-    """Smoke test: start server, run one episode without GPU."""
-    logger.info("Starting dry-run smoke test...")
-    _start_server_background()
+# ---------------------------------------------------------------------------
+# Dataset construction
+# ---------------------------------------------------------------------------
 
-    base_url = TRAIN_CONFIG["env_base_url"]
-    logger.info("Configuring LLM provider...")
-    configure_llm_provider(base_url)
+
+@dataclass(frozen=True)
+class PromptMeta:
+    seed: int
+    fault_type: str
+    tier: str
+
+
+def _cycle(items: list[str]) -> Iterable[str]:
+    idx = 0
+    while True:
+        yield items[idx % len(items)]
+        idx += 1
+
+
+def build_prompt_dataset(
+    env: ETLPipelineDoctorEnv,
+    tokenizer: Any,
+    *,
+    n_samples: int,
+    seed0: int,
+    fault_types: list[str],
+    tier: str,
+) -> tuple[list[str], dict[str, PromptMeta]]:
+    """Build a dataset of prompts by resetting the env to deterministic scenarios.
+
+    We bypass curriculum here by forcing `fault_type` and `tier` in reset kwargs so:
+      - prompts are actually conditioned on env observations,
+      - reward evaluation can reset to the same scenario for fair comparison,
+      - scoring does not skew curriculum via repeated record_outcome calls.
+    """
+    prompts: list[str] = []
+    meta: dict[str, PromptMeta] = {}
+
+    ft_iter = _cycle(fault_types)
+
+    for i in range(n_samples):
+        seed = seed0 + i
+        ft = next(ft_iter)
+        obs = env.reset(seed=seed, fault_type=ft, tier=tier)
+        prompt = build_prompt(tokenizer, obs)
+        prompts.append(prompt)
+        meta[prompt] = PromptMeta(seed=seed, fault_type=ft, tier=tier)
+
+    return prompts, meta
+
+
+# ---------------------------------------------------------------------------
+# Reward function (GRPO)
+# ---------------------------------------------------------------------------
+
+
+def make_reward_fn(
+    env: ETLPipelineDoctorEnv,
+    prompt_meta: dict[str, PromptMeta],
+    *,
+    penalty_invalid: float = -0.5,
+) -> Any:
+    """Create a reward function compatible with TRL GRPOTrainer."""
+
+    lock = threading.Lock()
+
+    def _reward(completions: list[str], prompts: list[str], **_: Any) -> list[float]:
+        rewards: list[float] = []
+
+        # Guard against TRL calling reward in parallel threads.
+        with lock:
+            for i, (completion, prompt) in enumerate(zip(completions, prompts, strict=False)):
+                meta = prompt_meta.get(prompt)
+                if meta is None:
+                    # Unknown prompt: treat as invalid and keep going.
+                    logger.warning("Missing prompt metadata for completion %d; assigning penalty.", i)
+                    rewards.append(penalty_invalid)
+                    continue
+
+                # Reset to the exact same deterministic scenario for each completion so
+                # rewards are comparable within a GRPO generation batch.
+                try:
+                    env.reset(seed=meta.seed, fault_type=meta.fault_type, tier=meta.tier)
+                except Exception as exc:
+                    logger.warning("Env reset failed for completion %d: %s", i, exc)
+                    rewards.append(penalty_invalid)
+                    continue
+
+                command = extract_first_command(completion)
+                if not command:
+                    rewards.append(penalty_invalid)
+                    continue
+
+                try:
+                    obs = env.step(ETLAction(command=command))
+                    step_reward = float(getattr(obs, "step_reward", 0.0) or 0.0)
+                    terminal_reward = float(getattr(obs, "terminal_reward", 0.0) or 0.0)
+                    r = step_reward + terminal_reward
+                    rewards.append(r)
+                except Exception as exc:
+                    logger.warning("Env step failed for completion %d: %s", i, exc)
+                    rewards.append(penalty_invalid)
+
+        return rewards
+
+    return _reward
+
+
+# ---------------------------------------------------------------------------
+# CLI entry points
+# ---------------------------------------------------------------------------
+
+
+def run_dry_run(args: argparse.Namespace) -> None:
+    base_url = args.env_base_url
+    ensure_server_running(base_url)
+
+    if args.configure_judge:
+        configure_judge_provider(
+            base_url,
+            provider=args.judge_provider,
+            model=args.judge_model,
+            api_key_env=args.judge_api_key_env,
+            provider_base_url=args.judge_base_url,
+        )
 
     env = ETLPipelineDoctorEnv(base_url=base_url)
-
     try:
-        obs = env.reset()
-        logger.info("Reset OK. Alert: %s", obs.alert[:60] if obs.alert else "(no alert)")
+        obs = env.reset(seed=args.seed, fault_type=args.fault_types[0], tier=args.tier)
+        logger.info("Dry-run reset OK. episode_id=%s alert=%s", obs.episode_id, (obs.alert or "")[:80])
 
-        action = ETLAction(
-            command="TRACE LINEAGE gold.kpi_daily_revenue",
-        )
-        obs = env.step(action)
-        logger.info("Step OK. Reward: %.2f", obs.step_reward)
-        logger.info("Dry-run passed.")
+        obs2 = env.step(ETLAction(command="TRACE LINEAGE gold.kpi_daily_revenue"))
+        logger.info("Dry-run step OK. step_reward=%.4f terminal_reward=%.4f done=%s",
+                    obs2.step_reward, obs2.terminal_reward, obs2.episode_done)
     finally:
         env.close()
 
 
-def reward_fn(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
-    """Compute rewards for completions by executing on environment.
-
-    This is called by GRPOTrainer for each batch of completions.
-    We execute on the environment and return per-completion rewards.
-    """
-    rewards = []
-    env = kwargs.get("env")
-
-    # Reset environment for fresh episode before evaluating completions
-    try:
-        env.reset()
-    except Exception as exc:
-        logger.warning(f"Failed to reset environment for batch: {exc}")
-        return [-0.3] * len(completions)
-
-    for i, completion in enumerate(completions):
-        try:
-            # Extract command from completion
-            command = completion.strip().split('\n')[0].strip()
-
-            # Filter out artifacts
-            if not command or command.lower() in ('yes', 'no', 'ok', 'done', 'unknown'):
-                logger.debug(f"  Completion {i}: skipped empty/artifact")
-                rewards.append(-0.3)
-                continue
-
-            # Execute on environment
-            action = ETLAction(command=command)
-            obs = env.step(action)
-            reward = float(obs.step_reward or 0.0)
-
-            cmd_short = command[:60] + "..." if len(command) > 60 else command
-            logger.debug(f"  Completion {i}: '{cmd_short}' → reward={reward:.3f}")
-            rewards.append(reward)
-
-        except Exception as exc:
-            logger.warning(f"Reward error on completion {i}: {exc}")
-            rewards.append(-0.3)
-
-    avg_r = sum(rewards) / len(rewards) if rewards else 0.0
-    logger.info(f"Batch rewards: count={len(rewards)} avg={avg_r:.3f} min={min(rewards):.3f} max={max(rewards):.3f}")
-    return rewards
-
-
-def plot_rewards(csv_path: Path, out_path: Path = None):
-    """Plot reward curves from CSV log (no tensorboard needed)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
-    except ImportError:
-        logger.warning("matplotlib/numpy not available — skipping plot")
-        return
-
-    episodes, rewards = [], []
-    try:
-        with open(csv_path) as f:
-            reader = csv.reader(f)
-            next(reader)  # skip header
-            for row in reader:
-                if row:
-                    episodes.append(int(row[0]))
-                    rewards.append(float(row[1]))
-    except (FileNotFoundError, ValueError):
-        logger.warning("No valid reward data to plot")
-        return
-
-    if not episodes:
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    # Per-episode rewards
-    ax.plot(episodes, rewards, alpha=0.5, color="steelblue", marker="o", markersize=4, label="Per episode")
-
-    # Rolling average
-    if len(rewards) > 1:
-        window = min(10, len(rewards) // 3 or 1)
-        kernel = np.ones(window) / window
-        smoothed = np.convolve(rewards, kernel, mode="valid")
-        smooth_steps = episodes[window - 1:]
-        ax.plot(smooth_steps, smoothed, color="darkblue", linewidth=2.5, label=f"Rolling avg (window={window})")
-
-    # Trend line
-    z = np.polyfit(episodes, rewards, 1)
-    trend = np.poly1d(z)
-    ax.plot(episodes, trend(episodes), color="red", linewidth=1.5, linestyle="--",
-            label=f"Trend ({'↑' if z[0] > 0 else '↓'} {abs(z[0]):.4f}/ep)")
-
-    mean_r = sum(rewards) / len(rewards)
-    max_r = max(rewards)
-    min_r = min(rewards)
-
-    ax.text(
-        0.02, 0.98,
-        f"Episodes: {len(episodes)} | Mean: {mean_r:.3f} | Max: {max_r:.3f} | Min: {min_r:.3f}",
-        transform=ax.transAxes,
-        verticalalignment="top",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5)
-    )
-
-    ax.set_xlabel("Episode")
-    ax.set_ylabel("Total Reward")
-    ax.set_title("ETL Pipeline Doctor — GRPO Reward Curve")
-    ax.legend(loc="lower right")
-    ax.grid(True, alpha=0.3)
-    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-
-    plt.tight_layout()
-    save_path = out_path or csv_path.with_suffix(".png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    logger.info(f"Reward plot saved to {save_path}")
-
-
 def run_training(args: argparse.Namespace) -> None:
-    """Full GRPO training run (requires GPU)."""
-    global torch  # Make torch available to rollout_once
     try:
         import torch
+        from datasets import Dataset
         from peft import LoraConfig, get_peft_model
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from trl import GRPOConfig, GRPOTrainer
-        from datasets import Dataset
     except ImportError as exc:
         logger.error("Training dependencies missing. Install with: uv sync --extra train")
         raise SystemExit(1) from exc
 
-    output_dir = Path("training/grpo-output")
+    base_url = args.env_base_url
+    ensure_server_running(base_url)
+
+    if args.configure_judge:
+        configure_judge_provider(
+            base_url,
+            provider=args.judge_provider,
+            model=args.judge_model,
+            api_key_env=args.judge_api_key_env,
+            provider_base_url=args.judge_base_url,
+        )
+
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_id = args.model_id or TRAIN_CONFIG["model_id"]
+    model_id = args.model_id
     logger.info("Loading model: %s", model_id)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tokenizer.pad_token is None:
+    if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    dtype = torch.bfloat16 if args.bf16 else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, torch_dtype=torch.float16
-    ).cuda()
+        model_id,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+    )
+    if torch.cuda.is_available():
+        model = model.cuda()
+    else:
+        raise RuntimeError("CUDA is required for training in this script.")
 
-    lora_config = LoraConfig(
-        r=TRAIN_CONFIG["lora_r"],
-        lora_alpha=TRAIN_CONFIG["lora_alpha"],
-        lora_dropout=TRAIN_CONFIG["lora_dropout"],
+    lora_cfg = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         bias="none",
         target_modules="all-linear",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # Start env server
-    _start_server_background()
-    base_url = TRAIN_CONFIG["env_base_url"]
-
-    # Configure LLM provider
-    logger.info("Configuring LLM provider...")
-    configure_llm_provider(base_url)
-
-    # Create persistent client
+    # Persistent env connection for prompt generation + reward evaluation.
     env = ETLPipelineDoctorEnv(base_url=base_url)
-
-    # ---- Simple reusable dataset (no pre-computed resets) ----
-    # Dataset size should be larger than max_steps to ensure samples don't run out
-    dataset_prompt = "Diagnose and fix this broken ETL pipeline."
-    dataset_size = max(args.max_steps * 2, 100)  # At least 2x max_steps or 100 samples
-    train_ds = Dataset.from_dict({"prompt": [dataset_prompt] * dataset_size})
-
-    # ---- CSV-based reward logging ----
-    # Note: GRPOTrainer doesn't provide per-episode callbacks, so per-episode logging
-    # would require custom trainer modifications. Rewards are tracked in TRL's built-in logs.
-
-    # ---- Wrap reward function with environment access ----
-    def reward_func_with_env(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
-        """Reward function that has access to the environment."""
-        kwargs['env'] = env
-        return reward_fn(completions, prompts, **kwargs)
-
-    # ---- GRPO Config with optimizations ----
-    grpo_config = GRPOConfig(
-        output_dir=str(output_dir),
-        num_generations=args.num_generations,
-        max_steps=args.max_steps,
-        per_device_train_batch_size=TRAIN_CONFIG["per_device_train_batch_size"],
-        gradient_accumulation_steps=TRAIN_CONFIG["gradient_accumulation_steps"],
-        learning_rate=TRAIN_CONFIG["learning_rate"],
-        lr_scheduler_type="cosine",
-        warmup_steps=2,
-        max_grad_norm=1.0,
-        max_completion_length=TRAIN_CONFIG["max_completion_length"],
-        temperature=0.2,
-        save_steps=TRAIN_CONFIG["save_steps"],
-        logging_steps=10,
-        report_to="none",
-        # GPU Memory Optimizations
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-    )
-
-    trainer = GRPOTrainer(
-        model=model,
-        args=grpo_config,
-        reward_funcs=reward_func_with_env,
-        train_dataset=train_ds,
-        processing_class=tokenizer,
-        # Note: peft_config is not passed here since we already applied LoRA above
-    )
-
-    logger.info("Starting GRPO training for %d steps...", args.max_steps)
     try:
+        # Build prompt dataset with real env observations.
+        n_samples = max(args.max_steps * 2, 200)
+        prompts, meta = build_prompt_dataset(
+            env,
+            tokenizer,
+            n_samples=n_samples,
+            seed0=args.seed,
+            fault_types=args.fault_types,
+            tier=args.tier,
+        )
+        train_ds = Dataset.from_dict({"prompt": prompts})
+
+        reward_fn = make_reward_fn(
+            env,
+            meta,
+            penalty_invalid=args.penalty_invalid,
+        )
+
+        grpo_cfg = GRPOConfig(
+            output_dir=str(output_dir),
+            num_generations=args.num_generations,
+            max_steps=args.max_steps,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_steps=max(2, int(0.02 * args.max_steps)),
+            max_grad_norm=1.0,
+            max_completion_length=args.max_completion_length,
+            temperature=args.temperature,
+            save_steps=args.save_steps,
+            logging_steps=10,
+            report_to="none",
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+
+        trainer = GRPOTrainer(
+            model=model,
+            args=grpo_cfg,
+            reward_funcs=reward_fn,
+            train_dataset=train_ds,
+            processing_class=tokenizer,
+        )
+
+        logger.info("Starting GRPO training for %d steps...", args.max_steps)
         trainer.train()
+
+        # Save final checkpoint.
+        final_dir = output_dir / f"checkpoint-{args.max_steps}"
+        model.save_pretrained(str(final_dir))
+        tokenizer.save_pretrained(str(final_dir))
+        logger.info("Training complete. Saved to %s", final_dir)
     finally:
         env.close()
 
-    model.save_pretrained(str(output_dir / f"checkpoint-{args.max_steps}"))
-    tokenizer.save_pretrained(str(output_dir / f"checkpoint-{args.max_steps}"))
-    logger.info("Training complete. Checkpoint saved to %s", output_dir)
+
+def _parse_csv_list(value: str) -> list[str]:
+    items = [v.strip() for v in (value or "").split(",") if v.strip()]
+    if not items:
+        raise argparse.ArgumentTypeError("Expected a comma-separated non-empty list")
+    return items
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ETL Pipeline Doctor — GRPO Training")
-    parser.add_argument("--dry-run", action="store_true", help="Smoke test without GPU")
-    parser.add_argument("--model-id", default=None)
-    parser.add_argument("--num-generations", type=int, default=TRAIN_CONFIG["num_generations"])
-    parser.add_argument("--max-steps", type=int, default=TRAIN_CONFIG["max_steps"])
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="ETL Pipeline Doctor — GRPO Training")
+
+    p.add_argument("--dry-run", action="store_true", help="Smoke test server + env interaction")
+
+    p.add_argument("--env-base-url", default=DEFAULTS.env_base_url)
+    p.add_argument("--output-dir", default="training/grpo-output")
+
+    p.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    p.add_argument("--bf16", action="store_true", help="Use bfloat16 (recommended on Ampere+)")
+
+    p.add_argument("--lora-r", type=int, default=DEFAULTS.lora_r)
+    p.add_argument("--lora-alpha", type=int, default=DEFAULTS.lora_alpha)
+    p.add_argument("--lora-dropout", type=float, default=DEFAULTS.lora_dropout)
+
+    p.add_argument("--num-generations", type=int, default=DEFAULTS.num_generations)
+    p.add_argument("--max-steps", type=int, default=DEFAULTS.max_steps)
+    p.add_argument("--per-device-train-batch-size", type=int, default=DEFAULTS.per_device_train_batch_size)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULTS.gradient_accumulation_steps)
+    p.add_argument("--learning-rate", type=float, default=DEFAULTS.learning_rate)
+    p.add_argument("--temperature", type=float, default=0.2)
+    p.add_argument("--max-prompt-length", type=int, default=DEFAULTS.max_prompt_length)
+    p.add_argument("--max-completion-length", type=int, default=DEFAULTS.max_completion_length)
+    p.add_argument("--save-steps", type=int, default=DEFAULTS.save_steps)
+
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--fault-types",
+        type=_parse_csv_list,
+        default=_parse_csv_list("schema_drift,stale_partition,null_explosion,fanout_join,type_mismatch"),
+        help="Comma-separated fault types to train on (bypasses curriculum).",
+    )
+    p.add_argument("--tier", default="warmup", help="Tier to use with forced fault types.")
+
+    p.add_argument("--penalty-invalid", type=float, default=-0.5, help="Reward for invalid/unparseable outputs")
+
+    # Judge provider config (server-side LLM)
+    p.add_argument("--configure-judge", action="store_true", help="POST /configure before training")
+    p.add_argument("--judge-provider", default="groq", choices=["anthropic", "openai", "groq", "openrouter", "ollama"])
+    p.add_argument("--judge-model", default="llama-3.3-70b-versatile")
+    p.add_argument("--judge-api-key-env", default="GROQ_API_KEY")
+    p.add_argument("--judge-base-url", default="", help="Optional base_url for openai-compatible providers")
+
+    args = p.parse_args()
 
     if args.dry_run:
-        run_dry_run()
+        run_dry_run(args)
     else:
         run_training(args)
 

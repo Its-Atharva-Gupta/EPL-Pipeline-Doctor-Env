@@ -18,7 +18,7 @@ _BASE_SCENARIOS: dict[str, list[dict]] = {
     "schema_drift": [
         {
             "fault_type": "schema_drift",
-            "target_table": "bronze.orders_raw",
+            "target_table": "silver.orders_enriched",
             "params": {"old_column": "total_amount", "new_column": "order_total"},
             "affected_kpi": "gold.kpi_daily_revenue",
         }
@@ -50,7 +50,7 @@ _BASE_SCENARIOS: dict[str, list[dict]] = {
     "type_mismatch": [
         {
             "fault_type": "type_mismatch",
-            "target_table": "bronze.orders_raw",
+            "target_table": "silver.orders_enriched",
             "params": {"column": "total_amount", "cast_to": "TEXT"},
             "affected_kpi": "gold.kpi_daily_revenue",
         }

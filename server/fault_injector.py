@@ -96,7 +96,10 @@ class FaultInjector:
         cast_to = params.get("cast_to", "TEXT")
         # SQLite is dynamically typed; we simulate type mismatch by storing a text prefix
         if cast_to.upper() == "TEXT":
-            conn.execute(f"UPDATE {table} SET {column} = CAST({column} AS TEXT) || '_corrupted'")
+            # Prefix forces SQLite SUM()/numeric coercion to treat values as 0.0.
+            conn.execute(
+                f"UPDATE {table} SET {column} = 'corrupted_' || CAST({column} AS TEXT) || '_corrupted'"
+            )
 
     @property
     def active_faults(self) -> list[FaultSpec]:

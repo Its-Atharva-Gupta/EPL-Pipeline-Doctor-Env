@@ -187,6 +187,12 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
+# Shared provider config for env instances created by OpenEnv.
+try:
+    from .provider_state import set_provider_config
+except ImportError:
+    from server.provider_state import set_provider_config
+
 # -----------------------------
 # Create base OpenEnv app
 # -----------------------------
@@ -222,6 +228,7 @@ def startup_config():
     auto = _auto_configure()
     if auto:
         _provider_config = auto
+        set_provider_config(auto)
         logger.info(
             "Auto-configured judge: provider=%s model=%s",
             auto.provider,
@@ -261,6 +268,7 @@ def configure(config: ProviderConfig):
         )
 
     _provider_config = config
+    set_provider_config(config)
     logger.info(
         "Configured judge: provider=%s model=%s",
         config.provider,

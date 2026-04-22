@@ -206,3 +206,134 @@ class Warehouse:
         from .constants import DOWNSTREAM
 
         return DOWNSTREAM.get(table, [])
+
+    # ------------------------------------------------------------------
+    # Simple pipeline recomputation helpers (used for training environment)
+    # ------------------------------------------------------------------
+    def recompute_daily_sales(self) -> bool:
+        """Recompute silver.daily_sales from silver.orders_enriched.
+
+        Returns True on success; on failure, clears downstream tables so KPIs break.
+        """
+        conn = self.conn
+        try:
+            conn.execute("DELETE FROM silver_daily_sales")
+            conn.execute(
+                """
+                INSERT INTO silver_daily_sales (date, region, gross_revenue, order_count)
+                SELECT
+                    order_date AS date,
+                    region,
+                    SUM(total_amount) AS gross_revenue,
+                    COUNT(*) AS order_count
+                FROM silver_orders_enriched
+                WHERE region IS NOT NULL AND total_amount IS NOT NULL
+                GROUP BY order_date, region
+                ORDER BY order_date
+                """
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            logger.warning("Failed to recompute silver.daily_sales: %s", exc)
+            # Clear downstream so verification fails loudly.
+            try:
+                conn.execute("DELETE FROM silver_daily_sales")
+                conn.execute("DELETE FROM gold_kpi_daily_revenue")
+                conn.commit()
+            except sqlite3.Error:
+                pass
+            return False
+
+    def recompute_kpi_daily_revenue(self) -> bool:
+        """Recompute gold.kpi_daily_revenue from silver.daily_sales."""
+        conn = self.conn
+        try:
+            conn.execute("DELETE FROM gold_kpi_daily_revenue")
+            conn.execute(
+                """
+                INSERT INTO gold_kpi_daily_revenue (date, revenue, yoy_growth_pct)
+                SELECT
+                    date,
+                    ROUND(SUM(gross_revenue), 2) AS revenue,
+                    0.0 AS yoy_growth_pct
+                FROM silver_daily_sales
+                GROUP BY date
+                ORDER BY date
+                """
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            logger.warning("Failed to recompute gold.kpi_daily_revenue: %s", exc)
+            try:
+                conn.execute("DELETE FROM gold_kpi_daily_revenue")
+                conn.commit()
+            except sqlite3.Error:
+                pass
+            return False
+
+    def recompute_kpi_category_mix(self) -> bool:
+        """Recompute gold.kpi_category_mix from silver.orders_enriched + bronze.products_raw.
+
+        Intentionally uses an un-duplicated denominator so fanout joins can break the KPI.
+        """
+        conn = self.conn
+        try:
+            conn.execute("DELETE FROM gold_kpi_category_mix")
+            conn.execute(
+                """
+                WITH orders AS (
+                    SELECT
+                        order_date AS date,
+                        customer_id,
+                        total_amount,
+                        ((customer_id + CAST(substr(order_date, -2) AS INT)) % 50) + 1 AS product_id
+                    FROM silver_orders_enriched
+                    WHERE total_amount IS NOT NULL
+                ),
+                denom AS (
+                    SELECT date, SUM(total_amount) AS total_rev
+                    FROM orders
+                    GROUP BY date
+                ),
+                joined AS (
+                    SELECT o.date, p.category, o.total_amount
+                    FROM orders o
+                    JOIN bronze_products_raw p
+                      ON p.product_id = o.product_id
+                )
+                INSERT INTO gold_kpi_category_mix (date, category, revenue_share)
+                SELECT
+                    j.date,
+                    j.category,
+                    ROUND(SUM(j.total_amount) / d.total_rev, 6) AS revenue_share
+                FROM joined j
+                JOIN denom d
+                  ON d.date = j.date
+                GROUP BY j.date, j.category
+                ORDER BY j.date, j.category
+                """
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            logger.warning("Failed to recompute gold.kpi_category_mix: %s", exc)
+            try:
+                conn.execute("DELETE FROM gold_kpi_category_mix")
+                conn.commit()
+            except sqlite3.Error:
+                pass
+            return False
+
+    def recompute_downstream_from(self, qualified_table: str) -> None:
+        """Recompute downstream tables that depend on qualified_table."""
+        # For our small DAG, hardcode downstream recompute ordering.
+        if qualified_table in ("silver.orders_enriched", "silver_orders_enriched"):
+            self.recompute_daily_sales()
+            self.recompute_kpi_daily_revenue()
+            self.recompute_kpi_category_mix()
+        elif qualified_table in ("silver.daily_sales", "silver_daily_sales"):
+            self.recompute_kpi_daily_revenue()
+        elif qualified_table in ("bronze.products_raw", "bronze_products_raw"):
+            self.recompute_kpi_category_mix()

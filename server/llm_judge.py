@@ -28,8 +28,41 @@ class LLMJudge:
         tool_result: ToolResult,
         config: Any = None,  # ProviderConfig | None
     ) -> float:
+        score, _ = self.score_and_debug(
+            alert=alert,
+            compact_history=compact_history,
+            action=action,
+            tool_result=tool_result,
+            config=config,
+            include_prompts=False,
+            include_raw=False,
+        )
+        return score
+
+    def score_and_debug(
+        self,
+        alert: str,
+        compact_history: list[str],
+        action: ETLAction,
+        tool_result: ToolResult,
+        config: Any = None,  # ProviderConfig | None
+        *,
+        include_prompts: bool = True,
+        include_raw: bool = True,
+    ) -> tuple[float, dict[str, Any]]:
+        """Return judge score plus optional raw/provider debug info."""
+        from .llm_client import cache_has
+
         user_prompt = _build_user_prompt(alert, compact_history, action, tool_result)
         cache_key = _cache_key(_SYSTEM_PROMPT, user_prompt)
+
+        debug: dict[str, Any] = {
+            "cache_key": cache_key,
+            "cache_hit": cache_has(cache_key),
+        }
+        if include_prompts:
+            debug["system_prompt"] = _SYSTEM_PROMPT
+            debug["user_prompt"] = user_prompt
 
         try:
             raw = get_llm_response(
@@ -39,10 +72,15 @@ class LLMJudge:
                 timeout=OLLAMA_TIMEOUT,
                 cache_key=cache_key,
             )
-            return _parse_score(raw)
+            if include_raw:
+                debug["raw"] = raw
+            score, brief = _parse_score_and_brief(raw)
+            debug["brief"] = brief
+            return score, debug
         except Exception as exc:
             logger.warning("Judge call failed: %s — defaulting to 0.0", exc)
-            return 0.0
+            debug["error"] = str(exc)
+            return 0.0, debug
 
 
 def _build_user_prompt(
@@ -66,7 +104,7 @@ def _build_user_prompt(
     )
 
 
-def _parse_score(raw: str) -> float:
+def _parse_score_and_brief(raw: str) -> tuple[float, str]:
     try:
         # Find JSON in the response
         start = raw.find("{")
@@ -75,7 +113,8 @@ def _parse_score(raw: str) -> float:
             raise ValueError("No JSON found")
         data = json.loads(raw[start:end])
         score = float(data["score"])
-        return max(-1.0, min(1.0, score))
+        brief = str(data.get("brief", ""))
+        return max(-1.0, min(1.0, score)), brief
     except Exception as exc:
         logger.warning("Failed to parse judge response '%s': %s", raw[:100], exc)
-        return 0.0
+        return 0.0, ""
