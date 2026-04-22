@@ -6,11 +6,16 @@ import logging
 import threading
 from pathlib import Path
 
+import os
+import requests
+from dotenv import load_dotenv
 from client import ETLPipelineDoctorEnv
-from models import ETLAction, ToolName
+from models import ETLAction, ToolName, ProviderConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 TRAIN_CONFIG = {
     "model_id": "Qwen/Qwen3-0.6B",
@@ -79,12 +84,44 @@ def _start_server_background() -> threading.Thread:
     return t
 
 
+def configure_llm_provider(base_url: str = "http://localhost:8000") -> None:
+    """Configure the LLM provider (OpenAI by default)."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logger.warning(
+            "OPENAI_API_KEY not set. Judge will not be available. "
+            "Set OPENAI_API_KEY environment variable to enable LLM judge."
+        )
+        return
+
+    config = ProviderConfig(
+        provider="groq",
+        model="llama-3.3-70b-versatile",
+        api_key=api_key,
+    )
+
+    try:
+        response = requests.post(
+            f"{base_url}/configure",
+            json=config.model_dump(),
+            timeout=15,
+        )
+        response.raise_for_status()
+        logger.info("✓ LLM provider configured: Groq (llama-3.3-70b-versatile)")
+    except requests.RequestException as exc:
+        logger.warning("Failed to configure LLM provider: %s", exc)
+        logger.warning("Training will continue but judgment rewards will not be available.")
+
+
 def run_dry_run() -> None:
     """Smoke test: start server, run one episode without GPU."""
     logger.info("Starting dry-run smoke test...")
     _start_server_background()
 
     base_url = TRAIN_CONFIG["env_base_url"]
+    logger.info("Configuring LLM provider...")
+    configure_llm_provider(base_url)
+
     env = ETLPipelineDoctorEnv(base_url=base_url)
 
     try:
@@ -137,6 +174,10 @@ def run_training(args: argparse.Namespace) -> None:
     # Start env server
     _start_server_background()
     base_url = TRAIN_CONFIG["env_base_url"]
+
+    # Configure LLM provider
+    logger.info("Configuring LLM provider...")
+    configure_llm_provider(base_url)
 
     # Create persistent WebSocket client for the training loop
     env = ETLPipelineDoctorEnv(base_url=base_url)
