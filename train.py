@@ -122,8 +122,8 @@ def run_training(args: argparse.Namespace) -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, torch_dtype=torch.float16,  device_map="auto"
-    )
+        model_id, trust_remote_code=True, torch_dtype=torch.float16,  
+    ).cuda()
 
     lora_config = LoraConfig(
         r=TRAIN_CONFIG["lora_r"],
