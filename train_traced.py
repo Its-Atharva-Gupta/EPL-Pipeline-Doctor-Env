@@ -21,11 +21,16 @@ Usage: python train_traced.py --episodes 3 --dry-run
 import argparse
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+
+from client import ETLPipelineDoctorEnv
+from models import ETLAction, ToolName, ProviderConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,18 +38,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+load_dotenv()
+
+
+def configure_llm_provider(base_url: str = "http://localhost:8000") -> None:
+    """Configure the LLM provider (Groq by default)."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logger.warning(
+            "GROQ_API_KEY not set. Judge will not be available. "
+            "Set GROQ_API_KEY environment variable to enable LLM judge."
+        )
+        return
+
+    config = ProviderConfig(
+        provider="groq",
+        model="llama-3.3-70b-versatile",
+        api_key=api_key,
+    )
+
+    try:
+        response = requests.post(
+            f"{base_url}/configure",
+            json=config.model_dump(),
+            timeout=15,
+        )
+        response.raise_for_status()
+        logger.info("✓ LLM provider configured: Groq (llama-3.3-70b-versatile)")
+    except requests.RequestException as exc:
+        logger.warning("Failed to configure LLM provider: %s", exc)
+        logger.warning("Tracing will continue but judgment rewards will not be available.")
+
 
 class TrainingTracer:
-    """Instruments training loop with detailed logging."""
+    """Instruments training loop with detailed logging using WebSocket."""
 
-    def __init__(self, base_url: str = "http://localhost:8000", use_websocket: bool = False):
+    def __init__(self, base_url: str = "http://localhost:8000"):
         self.base_url = base_url.rstrip("/")
-        self.use_websocket = use_websocket
+        self.env = ETLPipelineDoctorEnv(base_url=base_url)
         self.episode_count = 0
         self.total_episodes = 0
-        self.ws = None
 
-    
+
 
     def format_reward_breakdown(self, breakdown: dict) -> str:
         """Format reward breakdown for display."""
@@ -78,43 +113,35 @@ class TrainingTracer:
         print("=" * 100)
 
         # ────────────────────────────────────────────────────────────────
-        # 1. RESET
+        # 1. RESET (WebSocket)
         # ────────────────────────────────────────────────────────────────
-        reset_payload = {}
-        if seed is not None:
-            reset_payload["seed"] = seed
-
-        logger.info(f"{progress} Calling /reset with seed={seed}")
+        logger.info(f"{progress} Calling reset with seed={seed}")
 
         try:
-            reset_resp = requests.post(
-                f"{self.base_url}/reset",
-                json=reset_payload,
-                timeout=10,
-            )
-            reset_resp.raise_for_status()
+            obs = self.env.reset(seed=seed)
         except Exception as e:
             logger.error(f"{progress} Reset failed: {e}")
             return {}
 
-        obs = reset_resp.json().get("observation", {})
-        episode_id = obs.get("episode_id", "unknown")
+        obs_dict = obs.model_dump()
+        episode_id = obs_dict.get("episode_id", "unknown")
 
         # ────────────────────────────────────────────────────────────────
-        # Get hidden state (fault type, etc.)
+        # Get hidden state (fault type, etc.) — stored on env instance
+        # ────────────────────────────────────────────────────────────────
         try:
-            state_resp = requests.get(f"{self.base_url}/state", timeout=10)
-            state = state_resp.json()
-            fault_type = state.get("fault_type", "unknown")
-            difficulty = state.get("difficulty", 0)
-        except Exception:
+            state = self.env.state()
+            fault_type = state.fault_type
+            difficulty = state.difficulty
+        except Exception as e:
+            logger.warning(f"Could not retrieve state: {e}")
             fault_type = "unknown"
             difficulty = 0
 
         print(f"\n📍 Episode ID: {episode_id}")
         print(f"🔧 Fault type: {fault_type}")
         print(f"📊 Difficulty: {difficulty}")
-        print(f"🚨 Alert: {obs.get('alert', 'N/A')[:80]}...")
+        print(f"🚨 Alert: {obs_dict.get('alert', 'N/A')[:80]}...")
 
         # ────────────────────────────────────────────────────────────────
         # 2. STEP LOOP
@@ -133,37 +160,36 @@ class TrainingTracer:
             # Simulate agent action (in real training, this comes from model)
             # For tracing, we use a simple heuristic: trace → inspect → sample → fix
             # ────────────────────────────────────────────────────────────────
-            action = self._choose_action(step_num, obs)
+            action_dict = self._choose_action(step_num, obs_dict)
 
             print(f"\n  📤 Action:")
-            print(f"      Tool: {action['tool_name']}")
-            if action['tool_args']:
-                print(f"      Args: {json.dumps(action['tool_args'], indent=12)}")
-            if action['reasoning']:
-                print(f"      Reasoning: {action['reasoning'][:70]}...")
+            print(f"      Tool: {action_dict['tool_name']}")
+            if action_dict['tool_args']:
+                print(f"      Args: {json.dumps(action_dict['tool_args'], indent=12)}")
+            if action_dict['reasoning']:
+                print(f"      Reasoning: {action_dict['reasoning'][:70]}...")
 
             # ────────────────────────────────────────────────────────────────
-            # Call /step
+            # Call step (WebSocket)
             # ────────────────────────────────────────────────────────────────
             try:
-                # OpenEnv expects action wrapped in "action" field
-                payload = {"action": action}
-                step_resp = requests.post(
-                    f"{self.base_url}/step",
-                    json=payload,
-                    timeout=30,
+                # Parse action_dict into ETLAction
+                tool_name = ToolName(action_dict.get("tool_name", "run_query"))
+                action = ETLAction(
+                    tool_name=tool_name,
+                    tool_args=action_dict.get("tool_args", {}),
+                    reasoning=action_dict.get("reasoning", ""),
                 )
-                step_resp.raise_for_status()
+                obs = self.env.step(action)
+                obs_dict = obs.model_dump()
             except Exception as e:
                 logger.error(f"  Step {step_num} failed: {e}")
                 break
 
-            obs = step_resp.json().get("observation", {})
-
             # ────────────────────────────────────────────────────────────────
             # Tool result
             # ────────────────────────────────────────────────────────────────
-            tool_output = obs.get("last_tool_output", "N/A")
+            tool_output = obs_dict.get("last_tool_output", "N/A")
             output_preview = tool_output[:80] + "..." if len(tool_output) > 80 else tool_output
             print(f"\n  📥 Tool result:")
             print(f"      {output_preview}")
@@ -171,11 +197,11 @@ class TrainingTracer:
             # ────────────────────────────────────────────────────────────────
             # Reward
             # ────────────────────────────────────────────────────────────────
-            step_reward = obs.get("step_reward", 0.0)
+            step_reward = obs_dict.get("step_reward", 0.0)
             cumulative_reward += step_reward
             rewards_per_step.append(step_reward)
 
-            breakdown = obs.get("step_reward_breakdown", {})
+            breakdown = obs_dict.get("step_reward_breakdown", {})
             print(f"\n  💰 Reward: {step_reward:+.4f}")
             if breakdown:
                 for key, val in breakdown.items():
@@ -188,7 +214,7 @@ class TrainingTracer:
             # ────────────────────────────────────────────────────────────────
             # Episode end check
             # ────────────────────────────────────────────────────────────────
-            episode_done = obs.get("episode_done", False)
+            episode_done = obs_dict.get("episode_done", False)
             if episode_done:
                 resolved = step_reward > 2.0  # Terminal reward threshold
                 print(f"\n  ✅ Episode ended at step {step_num}")
@@ -215,7 +241,7 @@ class TrainingTracer:
             "rewards_per_step": rewards_per_step,
         }
 
-    def _choose_action(self, step_num: int, obs: dict) -> dict:
+    def _choose_action(self, step_num: int, obs_dict: dict) -> dict:
         """
         Simple action selection heuristic for tracing.
 
@@ -225,7 +251,7 @@ class TrainingTracer:
         action_sequence = [
             {
                 "tool_name": "trace_lineage",
-                "tool_args": {"table": obs.get("available_kpis", ["gold.kpi_daily_revenue"])[0]},
+                "tool_args": {"table": obs_dict.get("available_kpis", ["gold.kpi_daily_revenue"])[0]},
                 "reasoning": "Trace KPI upstream to understand data lineage",
             },
             {
@@ -292,6 +318,8 @@ def main():
     )
     args = parser.parse_args()
 
+    base_url = "http://localhost:8000"
+
     if args.dry_run:
         logger.info("Starting server for dry-run...")
         from server.app import app
@@ -299,12 +327,16 @@ def main():
         def run_server():
             import uvicorn
 
-            uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
         server_thread = threading.Thread(target=run_server, daemon=True)
         server_thread.start()
         time.sleep(3)
         logger.info("Server ready")
+
+        # Configure LLM provider
+        logger.info("Configuring LLM provider...")
+        configure_llm_provider(base_url)
 
     print("\n")
     print("╔" + "=" * 98 + "╗")
@@ -314,15 +346,18 @@ def main():
     print("║" + " " * 98 + "║")
     print("╚" + "=" * 98 + "╝")
 
-    tracer = TrainingTracer()
+    tracer = TrainingTracer(base_url=base_url)
     tracer.total_episodes = args.episodes
 
-    # Run episodes
-    results = []
-    for ep in range(args.episodes):
-        result = tracer.run_episode(max_steps=args.max_steps, seed=42 + ep)
-        results.append(result)
-        time.sleep(0.5)
+    try:
+        # Run episodes
+        results = []
+        for ep in range(args.episodes):
+            result = tracer.run_episode(max_steps=args.max_steps, seed=42 + ep)
+            results.append(result)
+            time.sleep(0.5)
+    finally:
+        tracer.env.close()
 
     # ════════════════════════════════════════════════════════════════════════
     # FINAL SUMMARY
