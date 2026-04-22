@@ -1,0 +1,185 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    NEW WORKFLOW TRACING FILES CREATED                      ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+FIXED BUG
+─────────
+  File: server/etl_pipeline_doctor_environment.py
+  Line: 52 (moved after line 51)
+  Issue: CurriculumController always initialized with seed=0, causing
+         deterministic RNG → always picked "type_mismatch" fault type
+  Fix: Pass random seed to CurriculumController per environment instance
+  
+  Code changed:
+    OLD: self._curriculum = CurriculumController(self._catalogue, self._designer)
+         self._rng = random.Random()
+    
+    NEW: self._rng = random.Random()
+         self._curriculum = CurriculumController(
+             self._catalogue, 
+             self._designer, 
+             seed=self._rng.randint(0, 2**31)
+         )
+  
+  Result: Fault types now properly randomized across /reset calls
+
+
+NEW FILES FOR WORKFLOW VISIBILITY
+──────────────────────────────────
+
+1. workflow_trace.py
+   ├─ Purpose: Single-episode detailed trace showing complete workflow
+   ├─ Shows: Request/response for reset + steps + hidden state + REWARD BREAKDOWN
+   ├─ Run: python3 workflow_trace.py
+   ├─ Output: ~200 lines showing exactly what's sent and received
+   └─ Best for: Understanding workflow, debugging single episode
+
+2. train_traced.py  
+   ├─ Purpose: Multi-episode training trace with curriculum learning
+   ├─ Shows: Fault selection per episode, rewards per step, training progression
+   ├─ Run: python3 train_traced.py --episodes 5 --dry-run
+   ├─ Output: ~500-1000 lines showing learning over time
+   └─ Best for: Watching curriculum adapt, analyzing training progression
+
+3. WORKFLOW_TRACING.md
+   ├─ Purpose: Complete documentation of tracing tools
+   ├─ Covers: How to use, interpret output, configure judge, debugging
+   ├─ Read: In your editor or markdown viewer
+   └─ Best for: Understanding what each tracer shows
+
+4. HTTP_API_REFERENCE.md
+   ├─ Purpose: Complete HTTP API documentation
+   ├─ Covers: All endpoints, request/response formats, tool arguments
+   ├─ Read: When building custom tools or debugging API calls
+   └─ Best for: Quick lookup of endpoint details
+
+5. WORKFLOW_TOOLS_SUMMARY.md
+   ├─ Purpose: Overview and quick start guide
+   ├─ Covers: What you can see, quick start examples, debugging tips
+   ├─ Read: First, to understand what's available
+   └─ Best for: Getting started quickly
+
+
+QUICK START
+───────────
+
+See one episode in detail:
+  $ python3 workflow_trace.py
+
+Watch agent learn over 5 episodes:
+  $ python3 train_traced.py --episodes 5 --dry-run
+
+Understand the API:
+  $ cat HTTP_API_REFERENCE.md
+
+Learn about all tools:
+  $ cat WORKFLOW_TOOLS_SUMMARY.md
+
+
+KEY THINGS YOU CAN NOW SEE
+──────────────────────────
+
+✓ What sent to /reset
+  └─ seed, episode_id
+
+✓ What observation returned
+  └─ alert, available_tables, available_kpis, difficulty
+
+✓ Hidden state (not shown to agent)
+  └─ fault_type, resolved status, cumulative_reward
+
+✓ What action sent to /step
+  └─ tool_name, tool_args, reasoning
+
+✓ Reward breakdown
+  ├─ r_outcome (did it fix the fault?)
+  ├─ r_reasoning (judge score on logic)
+  ├─ r_efficiency (made progress?)
+  ├─ r_penalty (rule violations)
+  └─ TOTAL = 0.5×outcome + 0.3×reasoning + 0.2×efficiency + penalty
+
+✓ Curriculum state
+  ├─ Fault type selection per episode
+  ├─ Difficulty tier progression
+  ├─ Mastery EMA per fault type
+  └─ Tier promotions/demotions as agent learns
+
+✓ Training progression
+  ├─ Resolution rate per episode
+  ├─ Per-fault-type performance
+  └─ Reward trends
+
+
+REWARD BREAKDOWN EXAMPLES
+─────────────────────────
+
+Good diagnostic step:
+  r_outcome:   0.0  (investigating, not fixing yet)
+  r_reasoning: 0.8  (smart question)
+  r_efficiency:0.1  (discovered new info)
+  r_penalty:   0.0  (no violations)
+  ────────────────
+  TOTAL:       0.27
+
+Correct fix (episode end):
+  r_outcome:   1.0  (FIXED!)
+  r_reasoning: 0.8  (good reasoning)
+  r_efficiency:0.1  (efficient)
+  r_penalty:   0.0
+  terminal:   +3.0  (bonus for resolution)
+  ────────────────
+  TOTAL:      +3.64
+
+Wrong fix attempt:
+  r_outcome:  -1.0  (broke something or wrong fix type)
+  r_reasoning:-0.5  (didn't diagnose first)
+  r_efficiency:-0.2 (wrong fix type penalty)
+  r_penalty:  -0.5  (apply_fix without trace_lineage)
+  ────────────────
+  TOTAL:      -1.11
+
+
+UNDERSTAND CURRICULUM LEARNING
+───────────────────────────────
+
+Each episode:
+  1. Curriculum picks fault type (biased toward weak spots)
+  2. Fault is injected into warehouse
+  3. Agent gets alert + available tools
+  4. Agent takes steps and gets rewards
+  5. At episode end: record_outcome() updates EMA mastery
+
+Mastery EMA evolution:
+  new_ema = 0.8 × old_ema + 0.2 × success
+  (exponential moving average, window ~10 episodes)
+
+Tier progression:
+  ema ≥ 0.7 → promote to harder tier
+  ema ≤ 0.3 → demote to easier tier
+
+Over 20 episodes:
+  Ep 1-5:   All warmup tier, low difficulty
+  Ep 5-10:  Learned faults promote to beginner
+  Ep 10-15: Weak spots targeted by adversarial designer
+  Ep 15-20: Curriculum focuses on hardest faults
+
+See this in action:
+  $ python3 train_traced.py --episodes 20 --dry-run
+
+
+FILES NOT MODIFIED
+──────────────────
+✓ train.py           — unchanged, run normally
+✓ All other code     — unchanged, fully compatible
+✓ Only 1 line changed in etl_pipeline_doctor_environment.py (the seed fix)
+
+
+NEXT STEPS
+──────────
+1. Read WORKFLOW_TOOLS_SUMMARY.md
+2. Run: python3 workflow_trace.py
+3. Run: python3 train_traced.py --episodes 5 --dry-run
+4. Reference HTTP_API_REFERENCE.md as needed
+5. Build custom analysis tools using API reference
+
+Done! You can now see everything happening in the environment.

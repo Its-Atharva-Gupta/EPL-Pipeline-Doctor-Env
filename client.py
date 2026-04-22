@@ -1,49 +1,94 @@
-"""Sync HTTP client for the ETL Pipeline Doctor environment server."""
+"""
+ETL Pipeline Doctor Environment Client.
 
+Uses OpenEnv's EnvClient for stateful WebSocket sessions.
+One environment instance persists across reset() and step() calls.
+"""
+
+import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
-import requests
+from openenv.core.client_types import StepResult
+from openenv.core import EnvClient
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from models import ETLAction, ETLObservation, ETLState
 
 
+class ETLPipelineDoctorEnvAsync(EnvClient[ETLAction, ETLObservation, ETLState]):
+    """
+    Async client for the ETL Pipeline Doctor environment.
+
+    Uses WebSocket (/ws) to maintain stateful sessions.
+    One environment instance per connection — state persists across reset/step.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:8000", **kwargs) -> None:
+        kwargs.setdefault("message_timeout_s", 120.0)
+        super().__init__(base_url=base_url, **kwargs)
+
+    def _step_payload(self, action: ETLAction) -> Dict[str, Any]:
+        """Serialize ETLAction to JSON for WebSocket transmission."""
+        return action.model_dump()
+
+    def _parse_result(self, payload: Dict[str, Any]) -> StepResult[ETLObservation]:
+        """Parse WebSocket response into ETLObservation."""
+        obs_data = payload.get("observation", {})
+        observation = ETLObservation(**obs_data)
+        return StepResult(
+            observation=observation,
+            reward=payload.get("reward"),
+            done=payload.get("done", False),
+        )
+
+    def _parse_state(self, payload: Dict[str, Any]) -> ETLState:
+        """Parse state snapshot for debugging."""
+        payload.pop("judge", None)
+        return ETLState(**payload)
+
+
 class ETLPipelineDoctorEnv:
-    """Sync HTTP client wrapping the /reset, /step, /state endpoints."""
+    """
+    Synchronous wrapper around ETLPipelineDoctorEnvAsync.
 
-    def __init__(self, base_url: str = "http://localhost:8000") -> None:
-        self.base_url = base_url.rstrip("/")
-        self._session = requests.Session()
+    Provides sync reset() and step() methods by running async code in event loop.
 
-    def reset(self, seed: int | None = None, **kwargs) -> ETLObservation:
-        payload: dict[str, Any] = {}
-        if seed is not None:
-            payload["seed"] = seed
-        payload.update(kwargs)
-        resp = self._session.post(f"{self.base_url}/reset", json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return ETLObservation(**data.get("observation", data))
+    Example:
+        >>> env = ETLPipelineDoctorEnv(base_url="http://localhost:8000")
+        >>> obs = env.reset()
+        >>> obs = env.step(ETLAction(tool_name="trace_lineage", tool_args={"table": "gold.kpi_daily_revenue"}))
+        >>> env.close()
+    """
 
-    def step(self, action: ETLAction) -> ETLObservation:
-        payload = action.model_dump()
-        resp = self._session.post(f"{self.base_url}/step", json=payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return ETLObservation(**data.get("observation", data))
+    def __init__(self, base_url: str = "http://localhost:8000", **kwargs) -> None:
+        self._async_env = ETLPipelineDoctorEnvAsync(base_url=base_url, **kwargs)
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
 
-    def state(self) -> ETLState:
-        resp = self._session.get(f"{self.base_url}/state", timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        data.pop("judge", None)  # server adds "judge" key; ETLState doesn't have it
-        return ETLState(**data)
+    def reset(self, **kwargs) -> ETLObservation:
+        """Reset the environment (sync)."""
+        result = self._loop.run_until_complete(self._async_env.reset(**kwargs))
+        return result.observation
+
+    def step(self, action: ETLAction, **kwargs) -> ETLObservation:
+        """Execute an action (sync)."""
+        result = self._loop.run_until_complete(self._async_env.step(action, **kwargs))
+        return result.observation
+
+    def state(self, **kwargs) -> ETLState:
+        """Get environment state (sync)."""
+        result = self._loop.run_until_complete(self._async_env.state(**kwargs))
+        return result
 
     def close(self) -> None:
-        self._session.close()
+        """Close the connection and clean up."""
+        try:
+            self._loop.run_until_complete(self._async_env.close())
+        finally:
+            self._loop.close()
 
     def __enter__(self) -> "ETLPipelineDoctorEnv":
         return self

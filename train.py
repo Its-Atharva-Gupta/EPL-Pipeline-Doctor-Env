@@ -1,9 +1,13 @@
 """GRPO training entry point for ETL Pipeline Doctor."""
 
 import argparse
+import json
 import logging
 import threading
 from pathlib import Path
+
+from client import ETLPipelineDoctorEnv
+from models import ETLAction, ToolName
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -77,26 +81,26 @@ def _start_server_background() -> threading.Thread:
 
 def run_dry_run() -> None:
     """Smoke test: start server, run one episode without GPU."""
-    import requests
-
     logger.info("Starting dry-run smoke test...")
     _start_server_background()
 
-    base = TRAIN_CONFIG["env_base_url"]
+    base_url = TRAIN_CONFIG["env_base_url"]
+    env = ETLPipelineDoctorEnv(base_url=base_url)
 
-    obs = requests.post(f"{base}/reset", json={}).json()["observation"]
-    logger.info("Reset OK. Alert: %s", obs["alert"][:60])
+    try:
+        obs = env.reset()
+        logger.info("Reset OK. Alert: %s", obs.alert[:60] if obs.alert else "(no alert)")
 
-    action = {
-        "action": {
-            "tool_name": "trace_lineage",
-            "tool_args": {"table": "gold.kpi_daily_revenue"},
-            "reasoning": "Dry-run test — tracing lineage from KPI",
-        }
-    }
-    step_obs = requests.post(f"{base}/step", json=action).json()
-    logger.info("Step OK. Reward: %s", step_obs.get("reward"))
-    logger.info("Dry-run passed.")
+        action = ETLAction(
+            tool_name=ToolName.TRACE_LINEAGE,
+            tool_args={"table": "gold.kpi_daily_revenue"},
+            reasoning="Dry-run test — tracing lineage from KPI",
+        )
+        obs = env.step(action)
+        logger.info("Step OK. Reward: %.2f", obs.step_reward)
+        logger.info("Dry-run passed.")
+    finally:
+        env.close()
 
 
 def run_training(args: argparse.Namespace) -> None:
@@ -118,7 +122,7 @@ def run_training(args: argparse.Namespace) -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, torch_dtype=torch.bfloat16
+        model_id, trust_remote_code=True, torch_dtype=torch.float16,  device_map="auto"
     )
 
     lora_config = LoraConfig(
@@ -133,22 +137,25 @@ def run_training(args: argparse.Namespace) -> None:
     # Start env server
     _start_server_background()
     base_url = TRAIN_CONFIG["env_base_url"]
-    import requests
+
+    # Create persistent WebSocket client for the training loop
+    env = ETLPipelineDoctorEnv(base_url=base_url)
 
     def reward_fn(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
         """Call the env server to get rewards for each completion."""
         rewards = []
         for completion in completions:
             try:
-                import json as _json
-
-                action = _json.loads(completion)
-                obs_resp = requests.post(
-                    f"{base_url}/step",
-                    json={"action": action},
-                    timeout=15,
-                ).json()
-                rewards.append(float(obs_resp.get("reward", 0.0)))
+                action_dict = json.loads(completion)
+                # Parse action_dict into ETLAction
+                tool_name = ToolName(action_dict.get("tool_name", "run_query"))
+                action = ETLAction(
+                    tool_name=tool_name,
+                    tool_args=action_dict.get("tool_args", {}),
+                    reasoning=action_dict.get("reasoning", ""),
+                )
+                obs = env.step(action)
+                rewards.append(float(obs.step_reward or 0.0))
             except Exception as exc:
                 logger.warning("Reward fn error: %s", exc)
                 rewards.append(-0.3)
@@ -160,8 +167,8 @@ def run_training(args: argparse.Namespace) -> None:
     def _make_dataset(n_samples: int = 200) -> datasets.Dataset:
         rows = []
         for _ in range(n_samples):
-            obs = requests.post(f"{base_url}/reset", json={}).json()["observation"]
-            prompt = _build_prompt(obs)
+            obs = env.reset()
+            prompt = _build_prompt(obs.model_dump())
             rows.append({"prompt": prompt})
         return datasets.Dataset.from_list(rows)
 
@@ -174,9 +181,7 @@ def run_training(args: argparse.Namespace) -> None:
         max_steps=args.max_steps,
         per_device_train_batch_size=TRAIN_CONFIG["per_device_train_batch_size"],
         gradient_accumulation_steps=TRAIN_CONFIG["gradient_accumulation_steps"],
-        learning_rate=TRAIN_CONFIG["learning_rate"],
-        max_prompt_length=TRAIN_CONFIG["max_prompt_length"],
-        max_completion_length=TRAIN_CONFIG["max_completion_length"],
+        learning_rate=TRAIN_CONFIG["learning_rate"],        max_completion_length=TRAIN_CONFIG["max_completion_length"],
         save_steps=TRAIN_CONFIG["save_steps"],
         logging_steps=10,
         report_to="none",
@@ -191,7 +196,10 @@ def run_training(args: argparse.Namespace) -> None:
     )
 
     logger.info("Starting GRPO training for %d steps...", args.max_steps)
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        env.close()
 
     model.save_pretrained(str(output_dir / f"checkpoint-{args.max_steps}"))
     tokenizer.save_pretrained(str(output_dir / f"checkpoint-{args.max_steps}"))

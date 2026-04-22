@@ -38,7 +38,7 @@ _KPI_ALERTS: dict[str, list[str]] = {
 class EtlPipelineDoctorEnvironment(Environment):
     """RL environment for diagnosing and repairing broken ETL pipelines."""
 
-    SUPPORTS_CONCURRENT_SESSIONS: bool = True
+    SUPPORTS_CONCURRENT_SESSIONS: bool = False
 
     def __init__(self, provider_config: Any = None) -> None:
         super().__init__()
@@ -48,8 +48,8 @@ class EtlPipelineDoctorEnvironment(Environment):
         self._judge = LLMJudge()
         self._catalogue = FaultCatalogue()
         self._designer = AdversarialDesigner()
-        self._curriculum = CurriculumController(self._catalogue, self._designer)
         self._rng = random.Random()
+        self._curriculum = CurriculumController(self._catalogue, self._designer, seed=self._rng.randint(0, 2**31))
         self._provider_config: Any = provider_config  # ProviderConfig | None
 
         # Per-episode state
